@@ -1985,8 +1985,19 @@ class MainActivity : ComponentActivity() {
                 "com.rpmtech.expressopod.ACTION_QUEUE_CHANGED" -> {
                     val playedUrl = intent.getStringExtra("played_url")
                     if (playedUrl != null) {
-                        viewModelRef?.removeFromUpNextByUrl(playedUrl)
-                        viewModelRef?.syncPlaybackState()
+                        viewModelRef?.let { vm ->
+                            val statePrefs = context?.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                            val podJson = statePrefs?.getString("last_podcast", null)
+                            val epJson = statePrefs?.getString("last_episode", null)
+                            if (podJson != null) {
+                                try { vm.currentPodcast = Gson().fromJson(podJson, Podcast::class.java) } catch (_: Exception) {}
+                            }
+                            if (epJson != null) {
+                                try { vm.currentEpisode = Gson().fromJson(epJson, Episode::class.java) } catch (_: Exception) {}
+                            }
+                            vm.removeFromUpNextByUrl(playedUrl)
+                            vm.syncPlaybackState()
+                        }
                     }
                 }
                 "com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED" -> {

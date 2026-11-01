@@ -366,6 +366,38 @@ class PlaybackService : MediaSessionService() {
                     if (index in queueList.indices) {
                         val item = queueList[index]
                         val updatedQueue = queueList.toMutableList().apply { removeAt(index) }
+                        val updatedQueueJson = Gson().toJson(updatedQueue)
+
+                        val newEp = Episode(
+                            title = item.title,
+                            audioUrl = item.audioUrl,
+                            durationText = item.durationText
+                        )
+                        val newPod = Podcast(
+                            title = item.podcastTitle,
+                            author = item.podcastTitle,
+                            artworkUrl = item.artworkUrl,
+                            feedUrl = ""
+                        )
+
+                        val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                        statePrefs.edit()
+                            .putString("last_podcast", Gson().toJson(newPod))
+                            .putString("last_episode", Gson().toJson(newEp))
+                            .putLong("last_position", 0L)
+                            .apply()
+
+                        val fullQueue = QueueStorageManager.loadQueueFromBackup(applicationContext)
+                        if (fullQueue.isNotEmpty()) {
+                            val filteredFull = fullQueue.filterNot { it.episode.audioUrl == item.audioUrl }
+                            QueueStorageManager.saveQueueToBackup(applicationContext, Gson().toJson(filteredFull))
+                        }
+
+                        applicationContext.dataStore.edit {
+                            it[stringPreferencesKey("widget_queue_json")] = updatedQueueJson
+                            it[stringPreferencesKey("last_podcast")] = Gson().toJson(newPod)
+                            it[stringPreferencesKey("last_episode")] = Gson().toJson(newEp)
+                        }
 
                         val metadata = MediaMetadata.Builder()
                             .setTitle(item.title)
@@ -381,10 +413,6 @@ class PlaybackService : MediaSessionService() {
                         player.setMediaItem(mediaItem, 0L)
                         player.prepare()
                         player.play()
-
-                        applicationContext.dataStore.edit {
-                            it[stringPreferencesKey("widget_queue_json")] = Gson().toJson(updatedQueue)
-                        }
 
                         sendBroadcast(Intent("com.rpmtech.expressopod.ACTION_QUEUE_CHANGED").apply {
                             setPackage(packageName)
@@ -419,35 +447,47 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun updateWidgetState(player: Player) {
-        val title = player.mediaMetadata.title?.toString() ?: "No Episode Playing"
-        val artist = player.mediaMetadata.artist?.toString() ?: "Expressive Casts"
+        val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+        val epJson = statePrefs.getString("last_episode", null)
+        val podJson = statePrefs.getString("last_podcast", null)
+        val savedEp = if (epJson != null) {
+            try { Gson().fromJson(epJson, Episode::class.java) } catch (_: Exception) { null }
+        } else null
+        val savedPod = if (podJson != null) {
+            try { Gson().fromJson(podJson, Podcast::class.java) } catch (_: Exception) { null }
+        } else null
+
+        val currentMediaId = player.currentMediaItem?.mediaId
+        val matchesSavedEpisode = currentMediaId == null || savedEp == null || currentMediaId == savedEp.audioUrl
+
+        val itemMeta = player.currentMediaItem?.mediaMetadata
+        val playerMeta = player.mediaMetadata
+
+        val title = (if (matchesSavedEpisode && !savedEp?.title.isNullOrBlank()) savedEp?.title else null)
+            ?: itemMeta?.title?.toString()?.takeIf { it.isNotBlank() }
+            ?: playerMeta.title?.toString()?.takeIf { it.isNotBlank() }
+            ?: savedEp?.title
+            ?: "No Episode Playing"
+
+        val artist = (if (matchesSavedEpisode && !savedPod?.title.isNullOrBlank()) savedPod?.title else null)
+            ?: itemMeta?.artist?.toString()?.takeIf { it.isNotBlank() }
+            ?: playerMeta.artist?.toString()?.takeIf { it.isNotBlank() }
+            ?: savedPod?.title
+            ?: "Expressive Casts"
+
         val playing = player.isPlaying
-        val artworkUri = player.mediaMetadata.artworkUri?.toString() ?: ""
         val pos = player.currentPosition
         var duration = player.duration.takeIf { it > 0L } ?: 0L
 
-        if (duration <= 0L) {
-            val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
-            val epJson = statePrefs.getString("last_episode", null)
-            if (epJson != null) {
-                try {
-                    val ep = Gson().fromJson(epJson, Episode::class.java)
-                    duration = parseDurationMs(ep.durationText)
-                } catch (e: Exception) {}
-            }
+        if (duration <= 0L && savedEp != null) {
+            duration = parseDurationMs(savedEp.durationText)
         }
 
-        var finalArtUrl = artworkUri
-        if (finalArtUrl.isEmpty()) {
-            val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
-            val podJson = statePrefs.getString("last_podcast", null)
-            if (podJson != null) {
-                try {
-                    val pod = Gson().fromJson(podJson, Podcast::class.java)
-                    finalArtUrl = pod.artworkUrl
-                } catch (e: Exception) {}
-            }
-        }
+        val finalArtUrl = (if (matchesSavedEpisode && !savedPod?.artworkUrl.isNullOrBlank()) savedPod?.artworkUrl else null)
+            ?: itemMeta?.artworkUri?.toString()?.takeIf { it.isNotBlank() }
+            ?: playerMeta.artworkUri?.toString()?.takeIf { it.isNotBlank() }
+            ?: savedPod?.artworkUrl
+            ?: ""
 
         val remainingMs = if (duration > 0L && duration >= pos) (duration - pos) else 0L
         val remainingText = if (remainingMs > 0L) formatWidgetRemainingTime(remainingMs) else ""
