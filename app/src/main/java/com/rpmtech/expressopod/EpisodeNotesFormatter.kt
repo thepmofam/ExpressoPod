@@ -19,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -139,7 +140,8 @@ object EpisodeNotesFormatter {
         rawText: String,
         linkColor: Color,
         context: Context,
-        onSeekToMs: ((Long) -> Unit)? = null
+        onSeekToMs: ((Long) -> Unit)? = null,
+        onHaptic: (() -> Unit)? = null
     ): AnnotatedString {
         if (rawText.isBlank()) return AnnotatedString("")
 
@@ -195,6 +197,7 @@ object EpisodeNotesFormatter {
                             url = safeUrl,
                             styles = linkStyles,
                             linkInteractionListener = { link ->
+                                onHaptic?.invoke()
                                 val target = (link as? LinkAnnotation.Url)?.url ?: safeUrl
                                 SecurityUtils.openSafeUrl(context, target)
                             }
@@ -256,6 +259,7 @@ object EpisodeNotesFormatter {
                         url = safeUrl,
                         styles = linkStyles,
                         linkInteractionListener = { link ->
+                            onHaptic?.invoke()
                             val target = (link as? LinkAnnotation.Url)?.url ?: safeUrl
                             SecurityUtils.openSafeUrl(context, target)
                         }
@@ -292,6 +296,7 @@ object EpisodeNotesFormatter {
                                 tag = "timestamp_$ms",
                                 styles = timestampLinkStyles,
                                 linkInteractionListener = {
+                                    onHaptic?.invoke()
                                     onSeekToMs(ms)
                                 }
                             ),
@@ -316,12 +321,14 @@ fun FormattedEpisodeNotes(
     onSeekToMs: ((Long) -> Unit)? = null
 ) {
     val context = LocalContext.current
-    val annotatedNotes = remember(notesText, linkColor) {
+    val view = LocalView.current
+    val annotatedNotes = remember(notesText, linkColor, view) {
         EpisodeNotesFormatter.parseNotesToAnnotatedString(
             rawText = notesText,
             linkColor = linkColor,
             context = context,
-            onSeekToMs = onSeekToMs
+            onSeekToMs = onSeekToMs,
+            onHaptic = { view.performSubtleHaptic() }
         )
     }
 

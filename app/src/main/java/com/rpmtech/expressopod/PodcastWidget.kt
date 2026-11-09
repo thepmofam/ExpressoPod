@@ -4,6 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.BitmapShader
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Shader
 import android.net.Uri
 import android.os.Build
 import androidx.compose.runtime.collectAsState
@@ -16,17 +21,20 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.glance.ColorFilter
 import androidx.glance.GlanceId
 import androidx.glance.GlanceModifier
 import androidx.glance.GlanceTheme
 import androidx.glance.Image
 import androidx.glance.ImageProvider
+import androidx.glance.LocalSize
 import androidx.glance.action.ActionParameters
 import androidx.glance.action.actionParametersOf
 import androidx.glance.action.actionStartActivity
 import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.GlanceAppWidgetReceiver
+import androidx.glance.appwidget.SizeMode
 import androidx.glance.appwidget.action.ActionCallback
 import androidx.glance.appwidget.action.actionRunCallback
 import androidx.glance.appwidget.components.SquareIconButton
@@ -82,7 +90,7 @@ suspend fun Context.cacheWidgetArtwork(artUrl: String): Boolean {
             val loader = coil.ImageLoader(this@cacheWidgetArtwork)
             val request = coil.request.ImageRequest.Builder(this@cacheWidgetArtwork)
                 .data(artUrl)
-                .size(240, 240)
+                .size(512, 512)
                 .allowHardware(false)
                 .build()
             val result = (loader.execute(request) as? coil.request.SuccessResult)?.drawable
@@ -190,8 +198,168 @@ suspend fun Context.updateWidgetData(
     }
 }
 
+fun createCircularBitmap(src: Bitmap): Bitmap {
+    val size = minOf(src.width, src.height).coerceAtLeast(1)
+    val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(output)
+    val shader = BitmapShader(src, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+    if (src.width != src.height) {
+        val matrix = Matrix()
+        val dx = (size - src.width) / 2f
+        val dy = (size - src.height) / 2f
+        matrix.setTranslate(dx, dy)
+        shader.setLocalMatrix(matrix)
+    }
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+        this.shader = shader
+    }
+    val radius = size / 2f
+    canvas.drawCircle(radius, radius, radius, paint)
+    return output
+}
+
+suspend fun Context.updateAllPodcastWidgets() {
+    PodcastWidget().updateAll(this)
+    TurntableWidget().updateAll(this)
+}
+
 class PodcastWidgetReceiver : GlanceAppWidgetReceiver() {
     override val glanceAppWidget: GlanceAppWidget = PodcastWidget()
+}
+
+class TurntableWidgetReceiver : GlanceAppWidgetReceiver() {
+    override val glanceAppWidget: GlanceAppWidget = TurntableWidget()
+}
+
+class TurntableWidget : GlanceAppWidget() {
+    override val sizeMode: SizeMode = SizeMode.Exact
+
+    override suspend fun provideGlance(context: Context, id: GlanceId) {
+        withContext(Dispatchers.IO) {
+            val artFile = File(context.filesDir, "widget_artwork.png")
+            if (!artFile.exists() || artFile.length() == 0L) {
+                val statePrefs = context.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                val podJson = statePrefs.getString("last_podcast", null)
+                val savedArtUrl = if (podJson != null) {
+                    try {
+                        Gson().fromJson(podJson, Podcast::class.java)?.artworkUrl ?: ""
+                    } catch (_: Exception) {
+                        ""
+                    }
+                } else ""
+                if (savedArtUrl.isNotBlank()) {
+                    context.cacheWidgetArtwork(savedArtUrl)
+                }
+            }
+        }
+
+        provideContent {
+            val prefs by context.dataStore.data.collectAsState(initial = null)
+            val title = prefs?.get(stringPreferencesKey("widget_title")) ?: "ExpressoPod"
+            val isPlaying = prefs?.get(booleanPreferencesKey("widget_playing")) ?: false
+            val currentArtUrl = prefs?.get(stringPreferencesKey("widget_art_url")) ?: ""
+
+            val artFile = remember { File(context.filesDir, "widget_artwork.png") }
+            val circularArtBitmap: Bitmap? = remember(artFile.lastModified(), title, currentArtUrl) {
+                if (artFile.exists() && artFile.length() > 0) {
+                    try {
+                        val raw = BitmapFactory.decodeFile(artFile.absolutePath)
+                        if (raw != null) createCircularBitmap(raw) else null
+                    } catch (_: Exception) {
+                        null
+                    }
+                } else null
+            }
+
+            val size = LocalSize.current
+            val diameter = minOf(size.width, size.height).coerceAtLeast(96.dp)
+            val buttonSize = (diameter * 0.34f).coerceIn(44.dp, 80.dp)
+            val buttonInset = (diameter * 0.08f).coerceIn(8.dp, 22.dp)
+            val iconSize = (buttonSize * 0.52f).coerceIn(22.dp, 42.dp)
+
+            GlanceTheme {
+                val fallbackDiscColor = GlanceTheme.colors.surfaceVariant
+                val fallbackIconColor = GlanceTheme.colors.onSecondaryContainer
+                val buttonBgColor = GlanceTheme.colors.primaryContainer
+                val buttonContentColor = GlanceTheme.colors.onPrimaryContainer
+
+                Box(
+                    modifier = GlanceModifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = GlanceModifier.size(diameter),
+                        contentAlignment = Alignment.BottomStart
+                    ) {
+                        // Turntable Circle (Edge-to-edge Circular Podcast Cover Art, no border)
+                        Box(
+                            modifier = GlanceModifier
+                                .size(diameter)
+                                .clickable(actionStartActivity<MainActivity>()),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (circularArtBitmap != null) {
+                                Image(
+                                    provider = ImageProvider(circularArtBitmap),
+                                    contentDescription = title,
+                                    modifier = GlanceModifier.fillMaxSize()
+                                )
+                            } else {
+                                Box(
+                                    modifier = GlanceModifier.fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Image(
+                                        provider = ImageProvider(R.drawable.bg_widget_circle),
+                                        contentDescription = null,
+                                        colorFilter = ColorFilter.tint(fallbackDiscColor),
+                                        modifier = GlanceModifier.fillMaxSize()
+                                    )
+                                    Image(
+                                        provider = ImageProvider(R.drawable.ic_launcher_foreground),
+                                        contentDescription = title,
+                                        colorFilter = ColorFilter.tint(fallbackIconColor),
+                                        modifier = GlanceModifier.size(diameter * 0.6f)
+                                    )
+                                }
+                            }
+                        }
+
+                        // Bottom-left overlapping Circle Play/Pause button (the only button on the widget)
+                        Box(
+                            modifier = GlanceModifier
+                                .padding(start = buttonInset, bottom = buttonInset)
+                                .size(buttonSize),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Box(
+                                modifier = GlanceModifier
+                                    .fillMaxSize()
+                                    .clickable(actionRunCallback<PlayPauseWidgetAction>()),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Image(
+                                    provider = ImageProvider(R.drawable.bg_widget_circle),
+                                    contentDescription = null,
+                                    colorFilter = ColorFilter.tint(buttonBgColor),
+                                    modifier = GlanceModifier.fillMaxSize()
+                                )
+
+                                Image(
+                                    provider = ImageProvider(
+                                        if (isPlaying) R.drawable.ic_widget_pause else R.drawable.ic_widget_play
+                                    ),
+                                    contentDescription = if (isPlaying) "Pause" else "Play",
+                                    colorFilter = ColorFilter.tint(buttonContentColor),
+                                    modifier = GlanceModifier.size(iconSize)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 class PodcastWidget : GlanceAppWidget() {

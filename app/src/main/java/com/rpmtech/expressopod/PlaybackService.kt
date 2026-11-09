@@ -9,9 +9,14 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.glance.appwidget.updateAll
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.ForwardingPlayer
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
 import android.net.Uri
@@ -57,12 +62,50 @@ class PlaybackService : MediaSessionService() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var saveJob: kotlinx.coroutines.Job? = null
     private var loudnessEnhancer: LoudnessEnhancer? = null
+    @Volatile
+    private var currentRewindMs: Long = 15_000L
+    @Volatile
+    private var currentForwardMs: Long = 30_000L
 
     companion object {
         const val ACTION_PLAY_PAUSE = "com.rpmtech.expressopod.PLAY_PAUSE"
         const val ACTION_REWIND = "com.rpmtech.expressopod.REWIND"
         const val ACTION_FORWARD = "com.rpmtech.expressopod.FORWARD"
         const val ACTION_PLAY_QUEUE_INDEX = "com.rpmtech.expressopod.PLAY_QUEUE_INDEX"
+    }
+
+    private fun buildSavedEpisodeMediaItem(): Pair<MediaItem, Long>? {
+        val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+        val epJson = statePrefs.getString("last_episode", null) ?: return null
+        val podJson = statePrefs.getString("last_podcast", null) ?: return null
+        val lastPos = statePrefs.getLong("last_position", 0L)
+        return try {
+            val ep = Gson().fromJson(epJson, Episode::class.java) ?: return null
+            val pod = Gson().fromJson(podJson, Podcast::class.java) ?: return null
+            if (ep.audioUrl.isBlank()) return null
+            val posPrefs = applicationContext.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+            val rawSavedPos = posPrefs.getLong(ep.audioUrl, lastPos)
+            val epDurationMs = parseDurationMs(ep.durationText)
+            val savedPos = if (epDurationMs > 0L && rawSavedPos >= epDurationMs - 2000L) 0L else rawSavedPos
+
+            val metadata = MediaMetadata.Builder()
+                .setTitle(ep.title)
+                .setArtist(pod.title)
+                .setArtworkUri(Uri.parse(pod.artworkUrl))
+                .build()
+            val localUri = PodcastDownloadManager.getInstance(applicationContext).getLocalUriIfDownloaded(ep.audioUrl)
+                ?: LocalAudioManager.getInstance(applicationContext).getLocalUri(ep.audioUrl)
+            val playbackUri = localUri ?: Uri.parse(ep.audioUrl)
+            val item = MediaItem.Builder()
+                .setMediaId(ep.audioUrl)
+                .setUri(playbackUri)
+                .setMediaMetadata(metadata)
+                .build()
+            Pair(item, savedPos)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
     }
 
     private fun setupVolumeBoost(audioSessionId: Int) {
@@ -109,40 +152,189 @@ class PlaybackService : MediaSessionService() {
             .setPrioritizeTimeOverSizeThresholds(true)
             .build()
 
+        FeedCredentialsManager.init(this)
+
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("ExpressoPod/1.0")
             .setConnectTimeoutMs(8000)
             .setReadTimeoutMs(8000)
             .setAllowCrossProtocolRedirects(true)
-        val defaultDataSourceFactory = DefaultDataSource.Factory(this, httpDataSourceFactory)
 
-        val cacheDataSourceFactory = CacheDataSource.Factory()
-            .setCache(MediaCacheManager.getCache(this))
-            .setUpstreamDataSourceFactory(defaultDataSourceFactory)
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+        val resolvingHttpDataSourceFactory = androidx.media3.datasource.ResolvingDataSource.Factory(
+            httpDataSourceFactory
+        ) { dataSpec ->
+            val rawUriStr = dataSpec.uri.toString()
+            val scheme = dataSpec.uri.scheme?.lowercase()
+            if (scheme != "http" && scheme != "https") {
+                return@Factory dataSpec
+            }
+            val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            val lastPodJson = statePrefs.getString("last_podcast", null)
+            val lastFeedUrl = if (lastPodJson != null) {
+                try { Gson().fromJson(lastPodJson, Podcast::class.java)?.feedUrl } catch (_: Exception) { null }
+            } else null
 
-        // Dynamic DataSource Factory: checks cache_playing_episode preference on every stream request
-        val dynamicDataSourceFactory = androidx.media3.datasource.DataSource.Factory {
-            val prefs = applicationContext.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE)
-            val cacheEnabled = prefs.getBoolean("cache_playing_episode", true)
-            if (cacheEnabled) {
-                cacheDataSourceFactory.createDataSource()
+            val creds = FeedCredentialsManager.getCredentialsForUrl(rawUriStr, lastFeedUrl)
+            if (creds != null) {
+                val resolved = FeedCredentialsManager.resolveStreamForExoPlayer(rawUriStr, lastFeedUrl)
+                val targetUri = if (resolved != null && resolved.finalUrl.isNotBlank()) {
+                    Uri.parse(resolved.finalUrl)
+                } else {
+                    Uri.parse(FeedCredentialsManager.extractEmbeddedCredentials(rawUriStr).first)
+                }
+                val builder = dataSpec.buildUpon()
+                    .setUri(targetUri)
+                    .setKey(dataSpec.key ?: rawUriStr)
+                if (resolved?.attachAuthHeader == true) {
+                    val updatedHeaders = HashMap(dataSpec.httpRequestHeaders)
+                    updatedHeaders["Authorization"] = creds.toBasicAuthHeader()
+                    builder.setHttpRequestHeaders(updatedHeaders)
+                }
+                builder.build()
             } else {
-                defaultDataSourceFactory.createDataSource()
+                dataSpec
             }
         }
 
-        val player = ExoPlayer.Builder(this)
-            .setLoadControl(loadControl)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dynamicDataSourceFactory))
+        val cacheHttpDataSourceFactory = CacheDataSource.Factory()
+            .setCache(MediaCacheManager.getCache(this))
+            .setUpstreamDataSourceFactory(resolvingHttpDataSourceFactory)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+        // Dynamic HTTP DataSource Factory: checks cache_playing_episode preference on every HTTP stream request,
+        // while DefaultDataSource handles file:// and content:// local audio files directly.
+        val dynamicHttpDataSourceFactory = androidx.media3.datasource.DataSource.Factory {
+            val prefs = applicationContext.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE)
+            val cacheEnabled = prefs.getBoolean("cache_playing_episode", true)
+            if (cacheEnabled) {
+                cacheHttpDataSourceFactory.createDataSource()
+            } else {
+                resolvingHttpDataSourceFactory.createDataSource()
+            }
+        }
+
+        val dynamicDataSourceFactory = DefaultDataSource.Factory(this, dynamicHttpDataSourceFactory)
+
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(C.USAGE_MEDIA)
+            .setContentType(C.AUDIO_CONTENT_TYPE_SPEECH)
             .build()
 
-        setupVolumeBoost(player.audioSessionId)
+        val exoPlayer = ExoPlayer.Builder(this)
+            .setLoadControl(loadControl)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(dynamicDataSourceFactory))
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setSeekBackIncrementMs(currentRewindMs)
+            .setSeekForwardIncrementMs(currentForwardMs)
+            .build()
+
+        setupVolumeBoost(exoPlayer.audioSessionId)
+        exoPlayer.setPlaybackSpeed(PlaybackSpeedManager.getSpeedForSavedPodcast(applicationContext))
+
+        // Pre-populate saved episode if available so Bluetooth / lockscreen / headset play works immediately
+        buildSavedEpisodeMediaItem()?.let { (savedItem, savedPos) ->
+            exoPlayer.setMediaItem(savedItem, savedPos)
+            exoPlayer.prepare()
+        }
+
+        val player = object : ForwardingPlayer(exoPlayer) {
+            override fun play() {
+                if (currentMediaItem == null) {
+                    buildSavedEpisodeMediaItem()?.let { (savedItem, savedPos) ->
+                        setPlaybackSpeed(PlaybackSpeedManager.getSpeedForSavedPodcast(applicationContext))
+                        setMediaItem(savedItem, savedPos)
+                        prepare()
+                    }
+                } else if (playbackState == Player.STATE_IDLE) {
+                    prepare()
+                } else if (playbackState == Player.STATE_ENDED) {
+                    seekTo(0L)
+                }
+                super.play()
+            }
+
+            override fun getSeekBackIncrement(): Long = currentRewindMs
+
+            override fun getSeekForwardIncrement(): Long = currentForwardMs
+
+            override fun seekBack() {
+                val target = (currentPosition - currentRewindMs).coerceAtLeast(0L)
+                seekTo(target)
+                savePlaybackPosition(this)
+                updateWidgetState(this)
+                sendBroadcast(Intent("com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED").apply {
+                    setPackage(packageName)
+                    putExtra("is_playing", isPlaying)
+                    putExtra("position", target)
+                })
+            }
+
+            override fun seekForward() {
+                val dur = duration.takeIf { it > 0L } ?: Long.MAX_VALUE
+                val target = (currentPosition + currentForwardMs).coerceAtMost(dur)
+                seekTo(target)
+                savePlaybackPosition(this)
+                updateWidgetState(this)
+                sendBroadcast(Intent("com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED").apply {
+                    setPackage(packageName)
+                    putExtra("is_playing", isPlaying)
+                    putExtra("position", target)
+                })
+            }
+
+            override fun seekToNext() {
+                seekForward()
+            }
+
+            override fun seekToNextMediaItem() {
+                seekForward()
+            }
+
+            override fun seekToPrevious() {
+                seekBack()
+            }
+
+            override fun seekToPreviousMediaItem() {
+                seekBack()
+            }
+
+            override fun isCommandAvailable(command: Int): Boolean {
+                return when (command) {
+                    Player.COMMAND_PLAY_PAUSE,
+                    Player.COMMAND_SEEK_BACK,
+                    Player.COMMAND_SEEK_FORWARD,
+                    Player.COMMAND_SEEK_TO_NEXT,
+                    Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                    Player.COMMAND_SEEK_TO_PREVIOUS,
+                    Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                    Player.COMMAND_SET_SPEED_AND_PITCH -> true
+                    else -> super.isCommandAvailable(command)
+                }
+            }
+
+            override fun getAvailableCommands(): Player.Commands {
+                return super.getAvailableCommands()
+                    .buildUpon()
+                    .addAll(
+                        Player.COMMAND_PLAY_PAUSE,
+                        Player.COMMAND_SEEK_BACK,
+                        Player.COMMAND_SEEK_FORWARD,
+                        Player.COMMAND_SEEK_TO_NEXT,
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                        Player.COMMAND_SEEK_TO_PREVIOUS,
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                        Player.COMMAND_SET_SPEED_AND_PITCH
+                    )
+                    .build()
+            }
+        }
 
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 updateWidgetState(player)
-                if (!isPlaying) savePlaybackPosition(player)
+                if (!isPlaying) savePlaybackPosition(player, shouldQueueSyncAction = true)
                 sendBroadcast(Intent("com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED").apply {
                     setPackage(packageName)
                     putExtra("is_playing", isPlaying)
@@ -150,6 +342,9 @@ class PlaybackService : MediaSessionService() {
                 })
             }
             override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED) {
+                    savePlaybackPosition(player, shouldQueueSyncAction = true)
+                }
                 updateWidgetState(player)
                 sendBroadcast(Intent("com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED").apply {
                     setPackage(packageName)
@@ -213,13 +408,16 @@ class PlaybackService : MediaSessionService() {
             }
         })
 
-        // Listen for volume boost preference changes in real-time
+        // Listen for volume boost and skip preset preference changes in real-time
         serviceScope.launch {
             applicationContext.dataStore.data
-                .map { it[booleanPreferencesKey("volume_boost_enabled")] ?: false }
-                .distinctUntilChanged()
-                .collect { enabled ->
+                .collect { prefs ->
+                    val enabled = prefs[booleanPreferencesKey("volume_boost_enabled")] ?: false
                     updateVolumeBoost(enabled)
+                    val rSec = prefs[intPreferencesKey("rewind_sec")] ?: 15
+                    val fSec = prefs[intPreferencesKey("forward_sec")] ?: 30
+                    currentRewindMs = rSec * 1000L
+                    currentForwardMs = fSec * 1000L
                 }
         }
 
@@ -235,8 +433,51 @@ class PlaybackService : MediaSessionService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val sessionCallback = object : MediaSession.Callback {
+            override fun onConnect(
+                session: MediaSession,
+                controller: MediaSession.ControllerInfo
+            ): MediaSession.ConnectionResult {
+                val playerCommands = MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS
+                    .buildUpon()
+                    .addAll(
+                        Player.COMMAND_PLAY_PAUSE,
+                        Player.COMMAND_SEEK_BACK,
+                        Player.COMMAND_SEEK_FORWARD,
+                        Player.COMMAND_SEEK_TO_NEXT,
+                        Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                        Player.COMMAND_SEEK_TO_PREVIOUS,
+                        Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                        Player.COMMAND_SET_SPEED_AND_PITCH
+                    )
+                    .build()
+                return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                    .setAvailablePlayerCommands(playerCommands)
+                    .build()
+            }
+
+            override fun onPlaybackResumption(
+                mediaSession: MediaSession,
+                controller: MediaSession.ControllerInfo
+            ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+                val restored = buildSavedEpisodeMediaItem()
+                return if (restored != null) {
+                    Futures.immediateFuture(
+                        MediaSession.MediaItemsWithStartPosition(
+                            listOf(restored.first),
+                            0,
+                            restored.second
+                        )
+                    )
+                } else {
+                    Futures.immediateFailedFuture(UnsupportedOperationException("No saved episode"))
+                }
+            }
+        }
+
         mediaSession = MediaSession.Builder(this, player)
             .setSessionActivity(sessionActivity)
+            .setCallback(sessionCallback)
             .build()
 
         saveJob = serviceScope.launch {
@@ -290,11 +531,14 @@ class PlaybackService : MediaSessionService() {
                                         .setArtist(pod.title)
                                         .setArtworkUri(Uri.parse(pod.artworkUrl))
                                         .build()
+                                    val localUri = PodcastDownloadManager.getInstance(applicationContext).getLocalUriIfDownloaded(ep.audioUrl)
+                                        ?: LocalAudioManager.getInstance(applicationContext).getLocalUri(ep.audioUrl)
                                     val item = MediaItem.Builder()
                                         .setMediaId(ep.audioUrl)
-                                        .setUri(ep.audioUrl)
+                                        .setUri(localUri ?: Uri.parse(ep.audioUrl))
                                         .setMediaMetadata(metadata)
                                         .build()
+                                    player.setPlaybackSpeed(PlaybackSpeedManager.getSpeedForPodcast(applicationContext, pod))
                                     player.setMediaItem(item, lastPos)
                                     player.prepare()
                                     player.play()
@@ -364,36 +608,74 @@ class PlaybackService : MediaSessionService() {
                         emptyList()
                     }
                     if (index in queueList.indices) {
+                        savePlaybackPosition(player)
                         val item = queueList[index]
-                        val updatedQueue = queueList.toMutableList().apply { removeAt(index) }
-                        val updatedQueueJson = Gson().toJson(updatedQueue)
 
-                        val newEp = Episode(
+                        val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                        val prevPodJson = statePrefs.getString("last_podcast", null)
+                        val prevEpJson = statePrefs.getString("last_episode", null)
+                        val prevPod = if (prevPodJson != null) {
+                            try { Gson().fromJson(prevPodJson, Podcast::class.java) } catch (_: Exception) { null }
+                        } else null
+                        val prevEp = if (prevEpJson != null) {
+                            try { Gson().fromJson(prevEpJson, Episode::class.java) } catch (_: Exception) { null }
+                        } else null
+
+                        val fullQueue = QueueStorageManager.loadQueueFromBackup(applicationContext)
+                        val matchedQueueEntry = fullQueue.find { it.episode.audioUrl == item.audioUrl }
+                        val newEp = matchedQueueEntry?.episode ?: Episode(
                             title = item.title,
                             audioUrl = item.audioUrl,
                             durationText = item.durationText
                         )
-                        val newPod = Podcast(
+                        val newPod = matchedQueueEntry?.podcast ?: Podcast(
                             title = item.podcastTitle,
                             author = item.podcastTitle,
                             artworkUrl = item.artworkUrl,
                             feedUrl = ""
                         )
 
-                        val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                        val filteredFull = fullQueue.filterNot {
+                            it.episode.audioUrl == item.audioUrl ||
+                                (prevEp != null && it.episode.audioUrl == prevEp.audioUrl)
+                        }
+                        val updatedFullQueue = if (prevPod != null && prevEp != null && prevEp.audioUrl.isNotBlank() && prevEp.audioUrl != item.audioUrl) {
+                            listOf(QueueItem(prevPod, prevEp)) + filteredFull
+                        } else {
+                            filteredFull
+                        }
+                        val updatedFullQueueJson = Gson().toJson(updatedFullQueue)
+                        QueueStorageManager.saveQueueToBackup(applicationContext, updatedFullQueueJson)
+
+                        val posPrefs = applicationContext.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+                        val updatedWidgetQueue = updatedFullQueue.take(3).map { qItem ->
+                            val epDur = parseDurationMs(qItem.episode.durationText)
+                            val sPos = posPrefs.getLong(qItem.episode.audioUrl, 0L)
+                            val qRemMs = if (epDur > sPos) (epDur - sPos) else epDur
+                            val qRemText = if (qRemMs > 0L) formatWidgetRemainingTime(qRemMs) else ""
+                            WidgetQueueItem(
+                                title = qItem.episode.title,
+                                podcastTitle = qItem.podcast.title,
+                                durationText = qItem.episode.durationText,
+                                audioUrl = qItem.episode.audioUrl,
+                                artworkUrl = qItem.podcast.artworkUrl,
+                                remainingTimeText = qRemText
+                            )
+                        }
+                        val updatedQueueJson = Gson().toJson(updatedWidgetQueue)
+
+                        val rawNewPos = posPrefs.getLong(newEp.audioUrl, 0L)
+                        val newEpDurMs = parseDurationMs(newEp.durationText)
+                        val startPos = if (newEpDurMs > 0L && rawNewPos >= newEpDurMs - 2000L) 0L else rawNewPos
+
                         statePrefs.edit()
                             .putString("last_podcast", Gson().toJson(newPod))
                             .putString("last_episode", Gson().toJson(newEp))
-                            .putLong("last_position", 0L)
+                            .putLong("last_position", startPos)
                             .apply()
 
-                        val fullQueue = QueueStorageManager.loadQueueFromBackup(applicationContext)
-                        if (fullQueue.isNotEmpty()) {
-                            val filteredFull = fullQueue.filterNot { it.episode.audioUrl == item.audioUrl }
-                            QueueStorageManager.saveQueueToBackup(applicationContext, Gson().toJson(filteredFull))
-                        }
-
                         applicationContext.dataStore.edit {
+                            it[stringPreferencesKey("up_next_queue")] = updatedFullQueueJson
                             it[stringPreferencesKey("widget_queue_json")] = updatedQueueJson
                             it[stringPreferencesKey("last_podcast")] = Gson().toJson(newPod)
                             it[stringPreferencesKey("last_episode")] = Gson().toJson(newEp)
@@ -404,13 +686,16 @@ class PlaybackService : MediaSessionService() {
                             .setArtist(item.podcastTitle)
                             .setArtworkUri(Uri.parse(item.artworkUrl))
                             .build()
+                        val localUri = PodcastDownloadManager.getInstance(applicationContext).getLocalUriIfDownloaded(item.audioUrl)
+                            ?: LocalAudioManager.getInstance(applicationContext).getLocalUri(item.audioUrl)
                         val mediaItem = MediaItem.Builder()
                             .setMediaId(item.audioUrl)
-                            .setUri(item.audioUrl)
+                            .setUri(localUri ?: Uri.parse(item.audioUrl))
                             .setMediaMetadata(metadata)
                             .build()
 
-                        player.setMediaItem(mediaItem, 0L)
+                        player.setPlaybackSpeed(PlaybackSpeedManager.getSpeedForPodcast(applicationContext, newPod))
+                        player.setMediaItem(mediaItem, startPos)
                         player.prepare()
                         player.play()
 
@@ -427,7 +712,7 @@ class PlaybackService : MediaSessionService() {
         return START_STICKY
     }
 
-    private fun savePlaybackPosition(player: Player) {
+    private fun savePlaybackPosition(player: Player, shouldQueueSyncAction: Boolean = false) {
         val mediaId = player.currentMediaItem?.mediaId ?: return
         val pos = player.currentPosition
         val duration = player.duration
@@ -437,6 +722,15 @@ class PlaybackService : MediaSessionService() {
             sharedPrefs.edit().remove(mediaId).apply()
             val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
             statePrefs.edit().putLong("last_position", 0L).apply()
+            if (shouldQueueSyncAction) {
+                GPodderSyncManager.onEpisodePlayedStateChanged(
+                    context = applicationContext,
+                    podcastUrl = null,
+                    episodeUrl = mediaId,
+                    played = true,
+                    durationMs = if (duration > 0) duration else 0L
+                )
+            }
             return
         }
         if (pos <= 0) return
@@ -444,6 +738,14 @@ class PlaybackService : MediaSessionService() {
         sharedPrefs.edit().putLong(mediaId, pos).apply()
         val statePrefs = applicationContext.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
         statePrefs.edit().putLong("last_position", pos).apply()
+        GPodderSyncManager.onPlaybackPositionUpdated(
+            context = applicationContext,
+            podcastUrl = null,
+            episodeUrl = mediaId,
+            positionMs = pos,
+            durationMs = if (duration > 0) duration else 0L,
+            shouldQueueSyncAction = shouldQueueSyncAction
+        )
     }
 
     private fun updateWidgetState(player: Player) {
@@ -503,7 +805,7 @@ class PlaybackService : MediaSessionService() {
                 artUrl = finalArtUrl,
                 queueJson = queueJson
             )
-            PodcastWidget().updateAll(this@PlaybackService)
+            applicationContext.updateAllPodcastWidgets()
         }
     }
 

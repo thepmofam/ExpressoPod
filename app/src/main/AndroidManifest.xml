@@ -41,8 +41,17 @@
             android:foregroundServiceType="mediaPlayback">
             <intent-filter>
                 <action android:name="androidx.media3.session.MediaSessionService" />
+                <action android:name="android.media.browse.MediaBrowserService" />
             </intent-filter>
         </service>
+
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
 
         <!-- Material 3 Home Screen Widget Receiver -->
         <receiver
@@ -54,6 +63,19 @@
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/podcast_widget_info" />
+        </receiver>
+
+        <!-- Material 3 Expressive Turntable Circle Widget Receiver -->
+        <receiver
+            android:name=".TurntableWidgetReceiver"
+            android:label="@string/turntable_widget_name"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/turntable_widget_info" />
         </receiver>
 
     </application>

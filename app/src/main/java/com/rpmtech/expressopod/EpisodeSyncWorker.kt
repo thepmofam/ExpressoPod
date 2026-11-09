@@ -17,6 +17,9 @@ class EpisodeSyncWorker(
 ) : CoroutineWorker(context, params) {
 
     override suspend fun doWork(): Result {
+        try {
+            FeedCredentialsManager.init(context)
+        } catch (_: Exception) {}
         val prefs = context.dataStore.data.first()
         val notificationsEnabled = prefs[KEY_NOTIFICATIONS_ENABLED] ?: false
         if (!notificationsEnabled) {
@@ -39,7 +42,7 @@ class EpisodeSyncWorker(
         val mutedPodcastUrls = prefs[KEY_MUTED_PODCASTS] ?: emptySet()
 
         for (podcast in subscriptions) {
-            if (mutedPodcastUrls.contains(podcast.feedUrl)) {
+            if (LocalAudioManager.isLocalPodcast(podcast) || mutedPodcastUrls.contains(podcast.feedUrl)) {
                 continue
             }
             try {

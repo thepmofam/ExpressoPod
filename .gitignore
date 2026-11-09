@@ -24,6 +24,7 @@ app/build/
 
 # Local configuration file (sdk path, keystores, etc.)
 local.properties
+keystore.properties
 *.jks
 *.keystore
 

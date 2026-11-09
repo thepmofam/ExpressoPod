@@ -11,6 +11,16 @@ class ExpressoPodApp : Application(), ImageLoaderFactory {
     override fun onCreate() {
         super.onCreate()
         try {
+            FeedCredentialsManager.init(this)
+        } catch (_: Exception) {}
+        try {
+            GPodderSyncManager.init(this)
+            val gpodderCfg = GPodderSyncManager.syncState.value.config
+            if (gpodderCfg.enabled && gpodderCfg.isConfigured) {
+                GPodderSyncWorker.schedulePeriodicSync(this, gpodderCfg.syncIntervalMinutes)
+            }
+        } catch (_: Exception) {}
+        try {
             NetworkModule.initCache(cacheDir)
         } catch (_: Exception) {}
     }

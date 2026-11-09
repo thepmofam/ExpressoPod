@@ -15,6 +15,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.util.Xml
+import android.view.HapticFeedbackConstants
+import android.view.View
 import android.view.WindowManager
 import android.widget.Toast
 import android.content.res.Configuration
@@ -26,10 +28,13 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.lerp
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
@@ -91,13 +96,21 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
@@ -110,6 +123,9 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.glance.appwidget.updateAll
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -132,6 +148,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
@@ -168,7 +185,8 @@ data class Podcast(
     @SerializedName("author") val author: String = "",
     @SerializedName("artworkUrl") val artworkUrl: String = "",
     @SerializedName("feedUrl") val feedUrl: String = "",
-    @SerializedName("description") val description: String = ""
+    @SerializedName("description") val description: String = "",
+    @SerializedName("isCustomFeed") val isCustomFeed: Boolean = false
 )
 
 @Keep
@@ -216,6 +234,7 @@ object SubscriptionStorageManager {
                         feedUrl = it.feedUrl.trim()
                     )
                 }
+                .distinctBy { it.feedUrl }
         } catch (_: Exception) {
             emptyList()
         }
@@ -336,6 +355,134 @@ object QueueStorageManager {
     }
 }
 
+object PlaybackSpeedManager {
+    private const val PREFS_NAME = "expressopod_settings"
+    const val KEY_SPEEDS_MAP = "subscription_playback_speeds"
+    const val KEY_GLOBAL_SPEED = "global_playback_speed"
+    const val MIN_SPEED = 0.5f
+    const val MAX_SPEED = 5.0f
+    const val DEFAULT_SPEED = 1.0f
+
+    private val mapStringFloatType: java.lang.reflect.Type =
+        object : TypeToken<Map<String, Float?>>() {}.type
+
+    fun clampSpeed(speed: Float): Float {
+        if (speed.isNaN() || speed.isInfinite()) return DEFAULT_SPEED
+        val snapped = kotlin.math.round(speed * 10f) / 10f
+        return snapped.coerceIn(MIN_SPEED, MAX_SPEED)
+    }
+
+    fun formatSpeed(speed: Float): String {
+        val clamped = clampSpeed(speed)
+        return String.format(java.util.Locale.US, "%.1fx", clamped)
+    }
+
+    fun normalizeKey(feedUrl: String?, podcastTitle: String? = null): String {
+        val rawFeed = feedUrl?.trim().orEmpty()
+        if (rawFeed.isNotBlank()) {
+            val norm = FeedCredentialsManager.normalizeUrlKey(rawFeed)
+            if (norm.isNotBlank()) return norm
+            return rawFeed
+        }
+        val rawTitle = podcastTitle?.trim().orEmpty()
+        if (rawTitle.isNotBlank()) {
+            return "title:${rawTitle.lowercase(java.util.Locale.ROOT)}"
+        }
+        return "__default__"
+    }
+
+    fun parseSpeedsJson(json: String?): Map<String, Float> {
+        if (json.isNullOrBlank()) return emptyMap()
+        return try {
+            val raw: Map<String, Float?>? = appGson.fromJson(json, mapStringFloatType)
+            raw?.mapNotNull { (k, v) ->
+                if (k.isNotBlank() && v != null) k to clampSpeed(v) else null
+            }?.toMap() ?: emptyMap()
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun loadSpeedsMap(context: Context): Map<String, Float> {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            parseSpeedsJson(prefs.getString(KEY_SPEEDS_MAP, null))
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    fun saveSpeedsMap(context: Context, speedsMap: Map<String, Float>) {
+        try {
+            val json = appGson.toJson(speedsMap)
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_SPEEDS_MAP, json)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    fun loadGlobalSpeed(context: Context): Float {
+        return try {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            clampSpeed(prefs.getFloat(KEY_GLOBAL_SPEED, DEFAULT_SPEED))
+        } catch (_: Exception) {
+            DEFAULT_SPEED
+        }
+    }
+
+    fun saveGlobalSpeed(context: Context, speed: Float) {
+        try {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putFloat(KEY_GLOBAL_SPEED, clampSpeed(speed))
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    fun getSpeedForPodcast(
+        context: Context,
+        podcast: Podcast?,
+        speedsMap: Map<String, Float> = loadSpeedsMap(context),
+        subscriptions: List<Podcast> = emptyList(),
+        globalSpeed: Float = loadGlobalSpeed(context)
+    ): Float {
+        val fallbackSpeed = clampSpeed(globalSpeed)
+        if (podcast == null) {
+            return speedsMap["__default__"]?.let { clampSpeed(it) } ?: fallbackSpeed
+        }
+        if (podcast.feedUrl.isNotBlank()) {
+            val normKey = normalizeKey(podcast.feedUrl, podcast.title)
+            speedsMap[normKey]?.let { return clampSpeed(it) }
+            speedsMap[podcast.feedUrl.trim()]?.let { return clampSpeed(it) }
+        }
+        if (podcast.title.isNotBlank()) {
+            val matchedSub = subscriptions.find {
+                it.title.trim().equals(podcast.title.trim(), ignoreCase = true) && it.feedUrl.isNotBlank()
+            } ?: SubscriptionStorageManager.loadSubscriptionsFromBackup(context).find {
+                it.title.trim().equals(podcast.title.trim(), ignoreCase = true) && it.feedUrl.isNotBlank()
+            }
+            if (matchedSub != null) {
+                val subNormKey = normalizeKey(matchedSub.feedUrl, matchedSub.title)
+                speedsMap[subNormKey]?.let { return clampSpeed(it) }
+                speedsMap[matchedSub.feedUrl.trim()]?.let { return clampSpeed(it) }
+            }
+            val titleKey = normalizeKey(null, podcast.title)
+            speedsMap[titleKey]?.let { return clampSpeed(it) }
+        }
+        return fallbackSpeed
+    }
+
+    fun getSpeedForSavedPodcast(context: Context): Float {
+        val statePrefs = context.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+        val podJson = statePrefs.getString("last_podcast", null)
+        val pod = if (podJson != null) {
+            try { appGson.fromJson(podJson, Podcast::class.java) } catch (_: Exception) { null }
+        } else null
+        return getSpeedForPodcast(context, pod)
+    }
+}
+
 
 fun formatHtmlDescription(rawHtml: String): String {
     if (rawHtml.isBlank()) return ""
@@ -428,17 +575,26 @@ fun formatTimeRemaining(remainingMs: Long): String {
 }
 
 // iTunes DTOs
-data class ItunesResponse(val results: List<ItunesItem> = emptyList())
+@Keep
+data class ItunesResponse(
+    @SerializedName("results") val results: List<ItunesItem?>? = emptyList()
+)
+
+@Keep
 data class ItunesItem(
-    val collectionName: String?,
-    val artistName: String?,
-    val artworkUrl600: String?,
-    val feedUrl: String?
+    @SerializedName("collectionId") val collectionId: Long? = null,
+    @SerializedName("collectionName") val collectionName: String? = null,
+    @SerializedName("artistName") val artistName: String? = null,
+    @SerializedName("artworkUrl600") val artworkUrl600: String? = null,
+    @SerializedName("feedUrl") val feedUrl: String? = null
 )
 
 interface ItunesApi {
     @GET("search?media=podcast&entity=podcast")
     suspend fun search(@Query("term") term: String): ItunesResponse
+
+    @GET("search?media=podcast&entity=podcast")
+    suspend fun searchWithLimit(@Query("term") term: String, @Query("limit") limit: Int = 24): ItunesResponse
 }
 
 // Removed Podcast Index
@@ -447,13 +603,47 @@ object NetworkModule {
     @Volatile
     private var _okHttp: OkHttpClient? = null
 
+    private val authInterceptor = Interceptor { chain ->
+        val originalReq = chain.request()
+        val urlStr = originalReq.url.toString()
+        if (originalReq.header("Authorization") != null || FeedCredentialsManager.hasConflictingQueryAuth(urlStr)) {
+            return@Interceptor chain.proceed(originalReq)
+        }
+
+        val creds = FeedCredentialsManager.getCredentialsForUrl(urlStr)
+        if (creds != null && FeedCredentialsManager.shouldAttachAuthDirectly(urlStr)) {
+            val authedReq = originalReq.newBuilder()
+                .header("Authorization", creds.toBasicAuthHeader())
+                .build()
+            return@Interceptor chain.proceed(authedReq)
+        }
+
+        val response = chain.proceed(originalReq)
+        if ((response.code == 401 || response.code == 403) && creds != null && !FeedCredentialsManager.hasConflictingQueryAuth(urlStr)) {
+            response.close()
+            val retryReq = originalReq.newBuilder()
+                .header("Authorization", creds.toBasicAuthHeader())
+                .build()
+            return@Interceptor chain.proceed(retryReq)
+        }
+        response
+    }
+
     val okHttp: OkHttpClient
         get() = _okHttp ?: synchronized(this) {
             _okHttp ?: OkHttpClient.Builder()
+                .addInterceptor(authInterceptor)
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                 .build().also { _okHttp = it }
         }
+
+    val downloadHttpClient: OkHttpClient by lazy {
+        okHttp.newBuilder()
+            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
 
     fun initCache(cacheDir: java.io.File) {
         try {
@@ -462,12 +652,50 @@ object NetworkModule {
                     val httpCache = okhttp3.Cache(java.io.File(cacheDir, "http_cache"), 25L * 1024 * 1024)
                     _okHttp = OkHttpClient.Builder()
                         .cache(httpCache)
+                        .addInterceptor(authInterceptor)
                         .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                         .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                         .build()
                 }
             }
         } catch (_: Exception) {}
+    }
+
+    fun executeAuthenticatedCall(
+        url: String,
+        feedUrl: String? = null,
+        explicitCreds: FeedCredentials? = null,
+        acceptHeader: String? = null,
+        client: OkHttpClient = okHttp
+    ): okhttp3.Response {
+        val (cleanUrl, embeddedCreds) = FeedCredentialsManager.extractEmbeddedCredentials(url)
+        val creds = explicitCreds?.takeIf { it.isValid }
+            ?: embeddedCreds?.takeIf { it.isValid }
+            ?: FeedCredentialsManager.getCredentialsForUrl(cleanUrl, feedUrl)
+
+        val attachInitialAuth = creds != null && (
+            explicitCreds != null ||
+                embeddedCreds != null ||
+                FeedCredentialsManager.shouldAttachAuthDirectly(cleanUrl, feedUrl)
+            ) && !FeedCredentialsManager.hasConflictingQueryAuth(cleanUrl)
+
+        val reqBuilder = Request.Builder()
+            .url(cleanUrl)
+            .header("User-Agent", "ExpressoPod/1.0")
+        if (!acceptHeader.isNullOrBlank()) {
+            reqBuilder.header("Accept", acceptHeader)
+        }
+        if (attachInitialAuth && creds != null) {
+            reqBuilder.header("Authorization", creds.toBasicAuthHeader())
+        }
+
+        val response = client.newCall(reqBuilder.build()).execute()
+        if ((response.code == 401 || response.code == 403) && creds != null && !attachInitialAuth && !FeedCredentialsManager.hasConflictingQueryAuth(cleanUrl)) {
+            response.close()
+            val retryReq = reqBuilder.header("Authorization", creds.toBasicAuthHeader()).build()
+            return client.newCall(retryReq).execute()
+        }
+        return response
     }
 
     val itunesApi: ItunesApi by lazy {
@@ -488,26 +716,63 @@ object NetworkModule {
         val channelLink: String = ""
     )
 
+    sealed class FeedFetchResult {
+        data class Success(val feedUrl: String, val parsedFeed: ParsedFeed) : FeedFetchResult()
+        data class AuthRequired(val httpCode: Int, val message: String) : FeedFetchResult()
+        data class Error(val message: String) : FeedFetchResult()
+    }
+
     private val feedCache = java.util.concurrent.ConcurrentHashMap<String, ParsedFeed>()
 
-    fun getCachedFeed(feedUrl: String): ParsedFeed? = feedCache[feedUrl]
+    fun getCachedFeed(feedUrl: String): ParsedFeed? = feedCache[FeedCredentialsManager.normalizeUrlKey(feedUrl)] ?: feedCache[feedUrl]
 
-    suspend fun fetchPodcastFeed(feedUrl: String): ParsedFeed? = withContext(Dispatchers.IO) {
+    suspend fun fetchPodcastFeedResult(
+        rawFeedUrl: String,
+        username: String? = null,
+        password: String? = null
+    ): FeedFetchResult = withContext(Dispatchers.IO) {
+        val normalizedInput = SecurityUtils.normalizeFeedUrl(rawFeedUrl)
+            ?: return@withContext FeedFetchResult.Error("Please enter a valid RSS feed URL (http:// or https://).")
+        val (cleanFeedUrl, embeddedCreds) = FeedCredentialsManager.extractEmbeddedCredentials(normalizedInput)
+        val explicitCreds = if (!username.isNullOrBlank() || !password.isNullOrBlank()) {
+            FeedCredentials(username?.trim() ?: "", password ?: "")
+        } else {
+            embeddedCreds
+        }
+
         val episodes = mutableListOf<Episode>()
-        var channelTitle = "Unknown"
-        var channelAuthor = "Unknown"
+        val seenAudioUrls = HashSet<String>()
+        var channelTitle = ""
+        var channelAuthor = ""
         var channelImage = ""
         var channelDescription = ""
         var channelLink = ""
-        
+        var sawRssOrFeedRoot = false
+
         try {
-            val req = Request.Builder()
-                .url(feedUrl)
-                .header("User-Agent", "ExpressoPod/1.0")
-                .header("Accept", "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8")
-                .build()
-            okHttp.newCall(req).execute().use { response ->
-                val stream = response.body?.byteStream() ?: return@withContext feedCache[feedUrl]
+            executeAuthenticatedCall(
+                url = cleanFeedUrl,
+                feedUrl = cleanFeedUrl,
+                explicitCreds = explicitCreds,
+                acceptHeader = "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8"
+            ).use { response ->
+                if (response.code == 401 || response.code == 403) {
+                    val hasProvidedCreds = (explicitCreds != null && explicitCreds.isValid) || FeedCredentialsManager.hasCredentials(cleanFeedUrl)
+                    val msg = if (hasProvidedCreds) {
+                        "Authentication failed (HTTP ${response.code}). Please verify your username and password."
+                    } else {
+                        "This private feed requires a username and password (HTTP ${response.code})."
+                    }
+                    return@withContext FeedFetchResult.AuthRequired(response.code, msg)
+                }
+
+                if (!response.isSuccessful) {
+                    return@withContext FeedFetchResult.Error("Server returned HTTP ${response.code} (${response.message.ifBlank { "Error" }}).")
+                }
+
+                val stream = response.body?.byteStream()
+                    ?: return@withContext FeedFetchResult.Error("Received an empty response from the server.")
+
                 val parser = Xml.newPullParser().apply {
                     setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
                     try {
@@ -541,7 +806,11 @@ object NetworkModule {
                     val tagName = parser.name ?: ""
                     when (eventType) {
                         XmlPullParser.START_TAG -> {
-                            if (tagName.equals("item", true)) {
+                            if (tagName.equals("rss", true) || tagName.equals("feed", true) || tagName.equals("channel", true)) {
+                                sawRssOrFeedRoot = true
+                            }
+                            if (tagName.equals("item", true) || tagName.equals("entry", true)) {
+                                sawRssOrFeedRoot = true
                                 insideItem = true
                                 title = ""; audioUrl = ""; pubDate = ""; duration = ""; description = ""; chaptersUrl = ""
                             } else if (tagName.equals("image", true)) {
@@ -549,17 +818,37 @@ object NetworkModule {
                             } else if (insideItem) {
                                 when {
                                     tagName.equals("title", true) -> title = readTextSafe()
-                                    tagName.equals("pubDate", true) -> pubDate = readTextSafe().take(16)
+                                    tagName.equals("pubDate", true) || tagName.equals("published", true) || tagName.equals("updated", true) -> {
+                                        if (pubDate.isBlank()) pubDate = readTextSafe().take(16)
+                                    }
                                     (tagName.equals("itunes:duration", true) || tagName.equals("duration", true)) -> duration = formatDurationText(readTextSafe())
-                                    tagName.equals("enclosure", true) -> audioUrl = parser.getAttributeValue(null, "url") ?: ""
+                                    tagName.equals("enclosure", true) -> audioUrl = parser.getAttributeValue(null, "url") ?: audioUrl
+                                    tagName.equals("media:content", true) -> {
+                                        if (audioUrl.isBlank()) {
+                                            val medium = parser.getAttributeValue(null, "medium") ?: ""
+                                            val type = parser.getAttributeValue(null, "type") ?: ""
+                                            val urlAttr = parser.getAttributeValue(null, "url") ?: ""
+                                            if (urlAttr.isNotBlank() && (medium.equals("audio", true) || type.startsWith("audio/", true) || urlAttr.contains(".mp3", true) || urlAttr.contains(".m4a", true))) {
+                                                audioUrl = urlAttr
+                                            }
+                                        }
+                                    }
+                                    tagName.equals("link", true) -> {
+                                        val rel = parser.getAttributeValue(null, "rel") ?: ""
+                                        val type = parser.getAttributeValue(null, "type") ?: ""
+                                        val href = parser.getAttributeValue(null, "href") ?: ""
+                                        if (audioUrl.isBlank() && href.isNotBlank() && (rel.equals("enclosure", true) || type.startsWith("audio/", true))) {
+                                            audioUrl = href
+                                        }
+                                    }
                                     (tagName.equals("podcast:chapters", true) || tagName.equals("chapters", true)) -> {
                                         chaptersUrl = parser.getAttributeValue(null, "url") ?: ""
                                     }
-                                    tagName.equals("content:encoded", true) -> {
+                                    tagName.equals("content:encoded", true) || tagName.equals("content", true) -> {
                                         val content = readTextSafe()
                                         if (content.isNotBlank()) description = content
                                     }
-                                    tagName.equals("description", true) -> {
+                                    tagName.equals("description", true) || tagName.equals("summary", true) -> {
                                         val desc = readTextSafe()
                                         if (description.isBlank() && desc.isNotBlank()) description = desc
                                     }
@@ -569,27 +858,46 @@ object NetworkModule {
                                     }
                                 }
                             } else {
-                                // Channel level tags (Podcasting 1.0 & 2.0)
+                                // Channel level tags (Podcasting 1.0 & 2.0 & Atom)
                                 when {
                                     tagName.equals("title", true) && !insideImage -> channelTitle = readTextSafe()
-                                    tagName.equals("itunes:author", true) -> channelAuthor = readTextSafe()
-                                    tagName.equals("podcast:person", true) -> channelAuthor = readTextSafe() // Podcasting 2.0
+                                    tagName.equals("itunes:author", true) || tagName.equals("author", true) -> {
+                                        val a = readTextSafe()
+                                        if (a.isNotBlank()) channelAuthor = a
+                                    }
+                                    tagName.equals("podcast:person", true) -> {
+                                        val p = readTextSafe()
+                                        if (channelAuthor.isBlank() && p.isNotBlank()) channelAuthor = p
+                                    }
                                     tagName.equals("itunes:image", true) -> channelImage = parser.getAttributeValue(null, "href") ?: channelImage
+                                    tagName.equals("logo", true) || tagName.equals("icon", true) -> {
+                                        val img = readTextSafe()
+                                        if (channelImage.isBlank() && img.isNotBlank()) channelImage = img
+                                    }
                                     tagName.equals("url", true) && insideImage -> channelImage = readTextSafe()
-                                    (tagName.equals("description", true) || tagName.equals("itunes:summary", true)) && !insideImage -> {
+                                    (tagName.equals("description", true) || tagName.equals("itunes:summary", true) || tagName.equals("subtitle", true)) && !insideImage -> {
                                         val d = readTextSafe()
                                         if (channelDescription.isBlank() && d.isNotBlank()) channelDescription = d
                                     }
                                     tagName.equals("link", true) && !insideImage -> {
-                                        val l = readTextSafe()
-                                        if (channelLink.isBlank() && l.isNotBlank()) channelLink = l
+                                        val href = parser.getAttributeValue(null, "href")
+                                        val rel = parser.getAttributeValue(null, "rel") ?: ""
+                                        if (!href.isNullOrBlank() && !rel.equals("self", true)) {
+                                            if (channelLink.isBlank()) channelLink = href.trim()
+                                        } else {
+                                            val l = readTextSafe()
+                                            if (channelLink.isBlank() && l.isNotBlank()) channelLink = l
+                                        }
                                     }
                                 }
                             }
                         }
                         XmlPullParser.END_TAG -> {
-                            if (tagName.equals("item", true) && insideItem) {
-                                if (audioUrl.isNotBlank()) episodes.add(Episode(title, pubDate, audioUrl, duration, description, chaptersUrl))
+                            if ((tagName.equals("item", true) || tagName.equals("entry", true)) && insideItem) {
+                                val cleanAudioUrl = audioUrl.trim()
+                                if (cleanAudioUrl.isNotBlank() && seenAudioUrls.add(cleanAudioUrl)) {
+                                    episodes.add(Episode(title, pubDate, cleanAudioUrl, duration, description, chaptersUrl.trim()))
+                                }
                                 insideItem = false
                             } else if (tagName.equals("image", true)) {
                                 insideImage = false
@@ -599,13 +907,35 @@ object NetworkModule {
                     eventType = parser.next()
                 }
             }
+        } catch (e: org.xmlpull.v1.XmlPullParserException) {
+            e.printStackTrace()
+            return@withContext FeedFetchResult.Error("The URL did not return a valid RSS/XML podcast feed.")
         } catch (e: Exception) {
             e.printStackTrace()
-            return@withContext feedCache[feedUrl]
+            return@withContext FeedFetchResult.Error("Could not connect to feed: ${e.localizedMessage ?: "Network error"}")
         }
-        val result = ParsedFeed(channelTitle, channelAuthor, channelImage, episodes, channelDescription, channelLink)
-        feedCache[feedUrl] = result
-        result
+
+        if (!sawRssOrFeedRoot && channelTitle.isBlank() && episodes.isEmpty()) {
+            return@withContext FeedFetchResult.Error("No valid podcast RSS feed found at this URL.")
+        }
+
+        val finalTitle = channelTitle.ifBlank { "Custom Podcast" }
+        val finalAuthor = channelAuthor.ifBlank { "Unknown" }
+        val result = ParsedFeed(finalTitle, finalAuthor, channelImage, episodes, channelDescription, channelLink)
+        feedCache[cleanFeedUrl] = result
+        feedCache[rawFeedUrl] = result
+        if (episodes.isNotEmpty()) {
+            FeedCredentialsManager.registerEpisodesForFeed(null, cleanFeedUrl, episodes.map { it.audioUrl })
+            GPodderSyncManager.registerFeedEpisodes(null, cleanFeedUrl, episodes)
+        }
+        FeedFetchResult.Success(cleanFeedUrl, result)
+    }
+
+    suspend fun fetchPodcastFeed(feedUrl: String): ParsedFeed? = withContext(Dispatchers.IO) {
+        when (val res = fetchPodcastFeedResult(feedUrl)) {
+            is FeedFetchResult.Success -> res.parsedFeed
+            else -> getCachedFeed(feedUrl)
+        }
     }
 }
 
@@ -616,6 +946,137 @@ object NetworkModule {
 class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     var searchQuery by mutableStateOf("")
     var podcasts by mutableStateOf<List<Podcast>>(emptyList())
+    var suggestedPodcasts by mutableStateOf<List<Podcast>>(
+        listOf(
+            Podcast(
+                title = "99% Invisible",
+                author = "Roman Mars",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/68/74/3f/68743fa6-c534-e01f-d03e-bb157eb15f5c/mza_11214174082973215888.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.simplecast.com/BqbsxVfO"
+            ),
+            Podcast(
+                title = "Darknet Diaries",
+                author = "Jack Rhysider",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts112/v4/79/0c/90/790c9059-1fb7-26dc-2114-56339006e1bb/mza_10219822976063918899.jpg/600x600bb.jpg",
+                feedUrl = "https://podcast.darknetdiaries.com"
+            ),
+            Podcast(
+                title = "Hardcore History",
+                author = "Dan Carlin",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts126/v4/0b/68/54/0b685427-9954-2392-f2eb-5c8ff64bf749/mza_7991378772933267736.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.feedburner.com/dancarlin/history?format=xml"
+            ),
+            Podcast(
+                title = "Song Exploder",
+                author = "Hrishikesh Hirway",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts122/v4/c9/9c/b6/c99cb638-21a2-24a5-c006-783847746368/mza_11367761233389904372.jpg/600x600bb.jpg",
+                feedUrl = "https://feed.songexploder.net/SongExploder"
+            ),
+            Podcast(
+                title = "The Vergecast",
+                author = "The Verge",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/0f/1c/71/0f1c71bc-6a23-623c-307f-2d6b66f9814d/mza_13479369191529237073.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.megaphone.fm/vergecast"
+            ),
+            Podcast(
+                title = "Freakonomics Radio",
+                author = "Freakonomics Radio + Stitcher",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/a7/7f/98/a77f9883-0b2f-2cf4-0a5f-ef3053df0e75/mza_403078916705116220.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.simplecast.com/Y8lFbOT4"
+            ),
+            Podcast(
+                title = "Lex Fridman Podcast",
+                author = "Lex Fridman",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts115/v4/5b/57/e0/5b57e08f-2e57-08b6-9a3f-8b07b09d2c79/mza_15238926846885143536.jpg/600x600bb.jpg",
+                feedUrl = "https://lexfridman.com/feed/podcast/"
+            ),
+            Podcast(
+                title = "Planet Money",
+                author = "NPR",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/54/2c/08/542c082d-248c-9495-c192-0704c0056f53/mza_17148528408398569713.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.npr.org/510289/podcast.xml"
+            ),
+            Podcast(
+                title = "Ologies with Alie Ward",
+                author = "Alie Ward",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/1c/4f/41/1c4f419e-8604-8b20-5853-c5d0b1a4f78b/mza_13788233099116750292.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.simplecast.com/FO6kxYGj"
+            ),
+            Podcast(
+                title = "Acquired",
+                author = "Ben Gilbert and David Rosenthal",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts116/v4/12/14/c6/1214c612-8421-c21d-52fa-54396331518b/mza_6892356137028493028.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.transistor.fm/acquired"
+            ),
+            Podcast(
+                title = "Stuff You Should Know",
+                author = "iHeartPodcasts",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts211/v4/85/d1/36/85d136b1-58b7-bd23-0356-3ee453ba71a3/mza_12440562626968273517.jpg/600x600bb.jpg",
+                feedUrl = "https://www.omnycontent.com/d/playlist/e73c998e-6e60-432f-8610-ae210140c5b1/A91018A4-EA4F-4130-BF55-AE270180C327/44710ECC-10BB-48D1-93C7-AE270180C33E/podcast.rss"
+            ),
+            Podcast(
+                title = "Radiolab",
+                author = "WNYC Studios",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/c2/21/d9/c221d95b-2612-63eb-9843-90e53d1007dc/mza_4010838340033827392.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.simplecast.com/EmVW7VGp"
+            ),
+            Podcast(
+                title = "Hard Fork",
+                author = "The New York Times",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts112/v4/5f/44/73/5f4473be-ff22-c628-4372-64ef55b52809/mza_11246537178436617638.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.simplecast.com/l2i9YnTd"
+            ),
+            Podcast(
+                title = "Waveform: The MKBHD Podcast",
+                author = "Vox Media Podcast Network",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts221/v4/d1/36/c4/d136c493-2c91-bc0c-563e-3eb4ff86d25f/mza_13407755449464785560.jpg/600x600bb.jpg",
+                feedUrl = "https://feeds.megaphone.fm/STU4418364045"
+            ),
+            Podcast(
+                title = "Accidental Tech Podcast",
+                author = "Marco Arment, Casey Liss, John Siracusa",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts113/v4/f2/42/67/f2426705-a258-0f50-f9e0-9658bd4e4431/mza_4991841458504992708.jpg/600x600bb.jpg",
+                feedUrl = "https://atp.fm/rss"
+            ),
+            Podcast(
+                title = "Syntax - Tasty Web Development Treats",
+                author = "Wes Bos & Scott Tolinski",
+                artworkUrl = "https://is1-ssl.mzstatic.com/image/thumb/Podcasts126/v4/c9/e8/13/c9e8138e-f66f-ef13-7d5b-8fc41b9e6c8f/mza_16565611432528551302.jpg/600x600bb.jpg",
+                feedUrl = "https://feed.syntax.fm/rss"
+            )
+        )
+    )
+    private val generalSuggestionTopics = listOf(
+        "top podcasts",
+        "science podcasts",
+        "history podcasts",
+        "true crime podcasts",
+        "comedy podcasts",
+        "business & economics podcasts",
+        "storytelling podcasts",
+        "design & culture podcasts",
+        "news & politics podcasts",
+        "gaming & pop culture podcasts",
+        "health & psychology podcasts",
+        "music & film podcasts",
+        "mystery & investigative podcasts",
+        "space & future podcasts"
+    )
+    private val techSuggestionTopics = listOf(
+        "technology podcasts",
+        "tech news & gadgets",
+        "software engineering & programming",
+        "artificial intelligence & machine learning",
+        "cybersecurity & hacking podcasts",
+        "linux & open source podcasts",
+        "android & mobile tech podcasts",
+        "startups & silicon valley podcasts"
+    )
+    private var suggestionTopicIndex = -1
+    private var techTopicIndex = -1
+    var hasLoadedOnlineSuggestions by mutableStateOf(false)
+    var isLoadingSuggestions by mutableStateOf(false)
+    var nowPlayingTabIndex by mutableIntStateOf(0) // 0 = Player, 1 = Chapters, 2 = Notes
 
     // Subscriptions screen selected podcast & episodes
     var subscriptionSelectedPodcast by mutableStateOf<Podcast?>(null)
@@ -624,6 +1085,9 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     // Discover screen selected podcast & episodes
     var discoverSelectedPodcast by mutableStateOf<Podcast?>(null)
     var discoverEpisodes by mutableStateOf<List<Episode>>(emptyList())
+
+    // Settings screen selected category
+    var settingsSelectedCategory by mutableStateOf<SettingsCategory?>(null)
 
     // Backwards-compatible delegating properties
     var selectedPodcast: Podcast?
@@ -676,12 +1140,39 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         .map { it[intPreferencesKey("forward_sec")] ?: 30 }
         .stateIn(viewModelScope, SharingStarted.Eagerly, 30)
 
-    private fun loadInitialSubscriptions(): List<Podcast> {
-        return SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+    // Local Audio Files (Imported from device)
+    private val localAudioManager = LocalAudioManager.getInstance(app)
+    val localAudioFiles = localAudioManager.localFiles
+    val localSubscriptionTitle = localAudioManager.subscriptionTitle
+    val isImportingLocalAudio = localAudioManager.isImporting
+
+    private fun mergeLocalAudioIntoSubscriptions(
+        base: List<Podcast>,
+        localFiles: List<LocalAudioFile>,
+        localTitle: String
+    ): List<Podcast> {
+        if (localFiles.isEmpty()) {
+            return base.filterNot { LocalAudioManager.isLocalPodcast(it) }
+        }
+        val localPodcast = localAudioManager.buildLocalPodcast(localTitle)
+        val idx = base.indexOfFirst { LocalAudioManager.isLocalPodcast(it) }
+        return if (idx >= 0) {
+            base.toMutableList().apply { this[idx] = localPodcast }
+        } else {
+            listOf(localPodcast) + base
+        }
     }
 
-    // Subscriptions
-    val subscriptions = app.dataStore.data
+    private fun loadInitialSubscriptions(): List<Podcast> {
+        val base = SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+        return mergeLocalAudioIntoSubscriptions(
+            base = base,
+            localFiles = localAudioManager.localFiles.value,
+            localTitle = localAudioManager.subscriptionTitle.value
+        )
+    }
+
+    private val rawSubscriptionsFlow = app.dataStore.data
         .catch { exception ->
             if (exception is IOException) {
                 emit(emptyPreferences())
@@ -689,8 +1180,9 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 throw exception
             }
         }
-        .map { prefs ->
-            val json = prefs[stringPreferencesKey("subscriptions")]
+        .map { prefs -> prefs[stringPreferencesKey("subscriptions")] }
+        .distinctUntilChanged()
+        .map { json ->
             val parsed = SubscriptionStorageManager.parseSubscriptionsJson(json)
             if (parsed.isNotEmpty()) {
                 SubscriptionStorageManager.saveSubscriptionsToBackup(app, json!!)
@@ -717,16 +1209,28 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
             }
         }
-        .stateIn(viewModelScope, SharingStarted.Eagerly, loadInitialSubscriptions())
 
-    private val _themeConfig = MutableStateFlow(
+    // Subscriptions (automatically includes Local Audio Files collection when files are added)
+    val subscriptions = combine(
+        rawSubscriptionsFlow,
+        localAudioFiles,
+        localSubscriptionTitle
+    ) { baseSubs, localFiles, localTitle ->
+        mergeLocalAudioIntoSubscriptions(baseSubs, localFiles, localTitle)
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, loadInitialSubscriptions())
+
+    var currentThemeConfig by mutableIntStateOf(
         app.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE).getInt("theme_config", 0)
     )
+        private set
+
+    private val _themeConfig = MutableStateFlow(currentThemeConfig)
     val themeConfig = _themeConfig.asStateFlow()
 
     val playbackPositions = app.dataStore.data
-        .map { prefs ->
-            val json = prefs[stringPreferencesKey("playback_positions")]
+        .map { prefs -> prefs[stringPreferencesKey("playback_positions")] }
+        .distinctUntilChanged()
+        .map { json ->
             if (json != null) {
                 try { Gson().fromJson<Map<String, Long>>(json, object : TypeToken<Map<String, Long>>() {}.type) }
                 catch (e: Exception) { emptyMap<String, Long>() }
@@ -762,18 +1266,207 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         .map { it[booleanPreferencesKey("show_remaining_time")] ?: false }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
+    val showMiniPlayer = app.dataStore.data
+        .map { it[booleanPreferencesKey("show_mini_player")] ?: true }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
     val volumeBoostEnabled = app.dataStore.data
         .map { it[booleanPreferencesKey("volume_boost_enabled")] ?: false }
         .stateIn(viewModelScope, SharingStarted.Eagerly, false)
 
+    var globalPlaybackSpeed by mutableFloatStateOf(PlaybackSpeedManager.loadGlobalSpeed(app))
+        private set
+
+    var subscriptionPlaybackSpeeds by mutableStateOf(PlaybackSpeedManager.loadSpeedsMap(app))
+        private set
+
+    val currentPlaybackSpeed: Float
+        get() = getPlaybackSpeedForPodcast(currentPodcast)
+
+    fun getPlaybackSpeedForPodcast(podcast: Podcast?): Float {
+        return PlaybackSpeedManager.getSpeedForPodcast(
+            context = app,
+            podcast = podcast,
+            speedsMap = subscriptionPlaybackSpeeds,
+            subscriptions = subscriptions.value,
+            globalSpeed = globalPlaybackSpeed
+        )
+    }
+
+    fun updateGlobalPlaybackSpeed(speed: Float) {
+        val clamped = PlaybackSpeedManager.clampSpeed(speed)
+        globalPlaybackSpeed = clamped
+        PlaybackSpeedManager.saveGlobalSpeed(app, clamped)
+        val effectiveSpeed = getPlaybackSpeedForPodcast(currentPodcast)
+        controller?.setPlaybackSpeed(effectiveSpeed)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    prefs[androidx.datastore.preferences.core.floatPreferencesKey(PlaybackSpeedManager.KEY_GLOBAL_SPEED)] = clamped
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun setPlaybackSpeedForPodcast(podcast: Podcast?, speed: Float) {
+        val clamped = PlaybackSpeedManager.clampSpeed(speed)
+        val updated = subscriptionPlaybackSpeeds.toMutableMap()
+        if (podcast == null) {
+            updated["__default__"] = clamped
+        } else {
+            val primaryKey = PlaybackSpeedManager.normalizeKey(podcast.feedUrl, podcast.title)
+            updated[primaryKey] = clamped
+            if (podcast.feedUrl.isNotBlank()) {
+                updated[podcast.feedUrl.trim()] = clamped
+            }
+            if (podcast.title.isNotBlank()) {
+                updated[PlaybackSpeedManager.normalizeKey(null, podcast.title)] = clamped
+                val matchedSub = subscriptions.value.find {
+                    it.title.trim().equals(podcast.title.trim(), ignoreCase = true) && it.feedUrl.isNotBlank()
+                }
+                if (matchedSub != null) {
+                    updated[PlaybackSpeedManager.normalizeKey(matchedSub.feedUrl, matchedSub.title)] = clamped
+                    updated[matchedSub.feedUrl.trim()] = clamped
+                }
+            }
+        }
+        subscriptionPlaybackSpeeds = updated
+        PlaybackSpeedManager.saveSpeedsMap(app, updated)
+        if (podcast == null ||
+            podcast.feedUrl == currentPodcast?.feedUrl ||
+            (podcast.title.isNotBlank() && podcast.title.equals(currentPodcast?.title, ignoreCase = true))
+        ) {
+            controller?.setPlaybackSpeed(clamped)
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val json = appGson.toJson(updated)
+                app.dataStore.edit { prefs ->
+                    prefs[stringPreferencesKey(PlaybackSpeedManager.KEY_SPEEDS_MAP)] = json
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun setPlaybackSpeedForCurrentPodcast(speed: Float) {
+        setPlaybackSpeedForPodcast(currentPodcast, speed)
+    }
+
     val cachePlayingEpisode = app.dataStore.data
         .map { it[booleanPreferencesKey("cache_playing_episode")] ?: true }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    val showUnplayedBadge = app.dataStore.data
+        .map { it[booleanPreferencesKey("show_unplayed_badge")] ?: true }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    val showDownloadedBadge = app.dataStore.data
+        .map { it[booleanPreferencesKey("show_downloaded_badge")] ?: true }
         .stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
     // Downloads for Offline Listening
     private val downloadManager = PodcastDownloadManager.getInstance(app)
     val downloadedEpisodes = downloadManager.downloadedEpisodes
     val activeDownloads = downloadManager.activeDownloads
+
+    // Subscription EpisodeUrls Map (normalizedFeedUrl -> List<String> of episode audioUrls) for subscription badges
+    private val _subscriptionEpisodesMap = MutableStateFlow<Map<String, List<String>>>(emptyMap())
+    val subscriptionEpisodesMap = _subscriptionEpisodesMap.asStateFlow()
+    private val refreshingSubscriptionFeeds = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun loadSubscriptionEpisodesCache() {
+        try {
+            val sp = app.getSharedPreferences("expressopod_sub_episodes_cache", Context.MODE_PRIVATE)
+            val json = sp.getString("feed_episodes_map", null)
+            if (!json.isNullOrBlank()) {
+                val type = object : TypeToken<Map<String, List<String>>>() {}.type
+                val loaded: Map<String, List<String>>? = appGson.fromJson(json, type)
+                if (loaded != null) {
+                    _subscriptionEpisodesMap.value = loaded
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    fun recordFeedEpisodesForBadges(feedUrl: String, episodes: List<Episode>) {
+        val normKey = FeedCredentialsManager.normalizeUrlKey(feedUrl)
+        if (normKey.isBlank()) return
+        val urls = episodes.mapNotNull { it.audioUrl.trim().takeIf { u -> u.isNotBlank() } }.distinct()
+        val currentMap = _subscriptionEpisodesMap.value
+        if (currentMap[normKey] == urls) return
+        val updated = currentMap.toMutableMap().apply {
+            put(normKey, urls)
+            if (feedUrl.trim() != normKey) {
+                put(feedUrl.trim(), urls)
+            }
+        }
+        _subscriptionEpisodesMap.value = updated
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val sp = app.getSharedPreferences("expressopod_sub_episodes_cache", Context.MODE_PRIVATE)
+                sp.edit().putString("feed_episodes_map", appGson.toJson(updated)).apply()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun refreshSubscriptionFeedsInBackground(subs: List<Podcast>) {
+        if (subs.isEmpty()) return
+        viewModelScope.launch(Dispatchers.IO) {
+            subs.forEach { podcast ->
+                if (LocalAudioManager.isLocalPodcast(podcast)) {
+                    recordFeedEpisodesForBadges(podcast.feedUrl, localAudioManager.getEpisodes())
+                    return@forEach
+                }
+                val normKey = FeedCredentialsManager.normalizeUrlKey(podcast.feedUrl)
+                if (normKey.isNotBlank()) {
+                    val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
+                    if (cached != null && cached.episodes.isNotEmpty()) {
+                        recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
+                    } else if (refreshingSubscriptionFeeds.add(normKey)) {
+                        launch(Dispatchers.IO) {
+                            try {
+                                val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
+                                if (parsed != null && parsed.episodes.isNotEmpty()) {
+                                    recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
+                                }
+                            } catch (_: Exception) {
+                            } finally {
+                                refreshingSubscriptionFeeds.remove(normKey)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Custom / Private RSS Feed Credentials State
+    val authenticatedFeedUrls = FeedCredentialsManager.authenticatedFeedUrls
+    var showCustomFeedDialog by mutableStateOf(false)
+    var customFeedDialogInitialUrl by mutableStateOf("")
+    var customFeedDialogEditPodcast by mutableStateOf<Podcast?>(null)
+    var customFeedDialogForceAuthExpanded by mutableStateOf(false)
+
+    fun openAddCustomFeedDialog(initialUrl: String = "", forceAuthExpanded: Boolean = false) {
+        customFeedDialogEditPodcast = null
+        customFeedDialogInitialUrl = initialUrl.trim()
+        customFeedDialogForceAuthExpanded = forceAuthExpanded
+        showCustomFeedDialog = true
+    }
+
+    fun openEditFeedCredentialsDialog(podcast: Podcast) {
+        customFeedDialogEditPodcast = podcast
+        customFeedDialogInitialUrl = podcast.feedUrl
+        customFeedDialogForceAuthExpanded = true
+        showCustomFeedDialog = true
+    }
+
+    fun dismissCustomFeedDialog() {
+        showCustomFeedDialog = false
+        customFeedDialogEditPodcast = null
+        customFeedDialogInitialUrl = ""
+        customFeedDialogForceAuthExpanded = false
+    }
 
     // Notifications (Opt-in via toggle)
     val notificationsEnabled = app.dataStore.data
@@ -810,8 +1503,18 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
     var isPlayingQueue by mutableStateOf(false)
     var playbackNavTarget by mutableStateOf<PlaybackNavTarget?>(null)
+    val gpodderSyncState = GPodderSyncManager.syncState
+    var positionsVersion by mutableIntStateOf(0)
 
     init {
+        FeedCredentialsManager.init(app)
+        GPodderSyncManager.init(app)
+        loadSubscriptionEpisodesCache()
+        viewModelScope.launch {
+            subscriptions.collect { subs ->
+                refreshSubscriptionFeedsInBackground(subs)
+            }
+        }
         // 1. Synchronously load last played podcast & episode from SharedPreferences
         val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
         val podJson = statePrefs.getString("last_podcast", null)
@@ -839,22 +1542,30 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
         // 2. Also keep DataStore in sync
         viewModelScope.launch {
-            app.dataStore.data.collect { prefs ->
-                if (currentPodcast == null) {
-                    val pJson = prefs[stringPreferencesKey("last_podcast")]
-                    if (pJson != null) {
-                        try { currentPodcast = Gson().fromJson(pJson, Podcast::class.java) } catch (_: Exception) {}
-                    }
+            val prefs = app.dataStore.data.firstOrNull() ?: return@launch
+            val played = prefs[androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")] ?: emptySet()
+            val archived = prefs[androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")] ?: emptySet()
+
+            if (currentPodcast == null) {
+                val pJson = prefs[stringPreferencesKey("last_podcast")]
+                if (pJson != null) {
+                    try { currentPodcast = Gson().fromJson(pJson, Podcast::class.java) } catch (_: Exception) {}
                 }
-                if (currentEpisode == null) {
-                    val eJson = prefs[stringPreferencesKey("last_episode")]
-                    if (eJson != null) {
-                        try {
-                            currentEpisode = Gson().fromJson(eJson, Episode::class.java)
-                            prepareControllerWithCurrentEpisode()
-                        } catch (_: Exception) {}
-                    }
+            }
+            if (currentEpisode == null) {
+                val eJson = prefs[stringPreferencesKey("last_episode")]
+                if (eJson != null) {
+                    try {
+                        currentEpisode = Gson().fromJson(eJson, Episode::class.java)
+                        prepareControllerWithCurrentEpisode()
+                    } catch (_: Exception) {}
                 }
+            }
+
+            // If the restored episode is already finished/played or archived, clear it so mini player doesn't linger
+            val ep = currentEpisode
+            if (ep != null && !isPlaying && (played.contains(ep.audioUrl) || archived.contains(ep.audioUrl))) {
+                clearCurrentPlayback()
             }
         }
 
@@ -867,6 +1578,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
         // Synchronously restore Up Next queue from persistent backup
         val initialQueue = QueueStorageManager.loadQueueFromBackup(app)
+            .filterNot { it.episode.audioUrl == currentEpisode?.audioUrl }
         if (initialQueue.isNotEmpty()) {
             upNextQueue = initialQueue
         }
@@ -875,9 +1587,27 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 val qJson = prefs[stringPreferencesKey("up_next_queue")]
                 if (!qJson.isNullOrBlank()) {
                     val parsed = QueueStorageManager.parseQueueJson(qJson)
+                        .filterNot { it.episode.audioUrl == currentEpisode?.audioUrl }
                     if (upNextQueue.isEmpty() && parsed.isNotEmpty()) {
                         upNextQueue = parsed
                     }
+                }
+                val speedsJson = prefs[stringPreferencesKey(PlaybackSpeedManager.KEY_SPEEDS_MAP)]
+                if (!speedsJson.isNullOrBlank() && subscriptionPlaybackSpeeds.isEmpty()) {
+                    val parsedSpeeds = PlaybackSpeedManager.parseSpeedsJson(speedsJson)
+                    if (parsedSpeeds.isNotEmpty()) {
+                        subscriptionPlaybackSpeeds = parsedSpeeds
+                        PlaybackSpeedManager.saveSpeedsMap(app, parsedSpeeds)
+                        controller?.setPlaybackSpeed(getPlaybackSpeedForPodcast(currentPodcast))
+                    }
+                }
+                val dsGlobalSpeed = prefs[androidx.datastore.preferences.core.floatPreferencesKey(PlaybackSpeedManager.KEY_GLOBAL_SPEED)]
+                val spSettingsForSpeed = app.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE)
+                if (dsGlobalSpeed != null && !spSettingsForSpeed.contains(PlaybackSpeedManager.KEY_GLOBAL_SPEED)) {
+                    val clampedGlobal = PlaybackSpeedManager.clampSpeed(dsGlobalSpeed)
+                    globalPlaybackSpeed = clampedGlobal
+                    PlaybackSpeedManager.saveGlobalSpeed(app, clampedGlobal)
+                    controller?.setPlaybackSpeed(getPlaybackSpeedForPodcast(currentPodcast))
                 }
             }
         }
@@ -886,7 +1616,8 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val spSettings = app.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE)
         if (spSettings.contains("theme_config")) {
             val savedThemePref = spSettings.getInt("theme_config", 0)
-            if (_themeConfig.value != savedThemePref) {
+            if (currentThemeConfig != savedThemePref) {
+                currentThemeConfig = savedThemePref
                 _themeConfig.value = savedThemePref
             }
         } else {
@@ -895,6 +1626,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 try {
                     val dsTheme = app.dataStore.data.firstOrNull()?.get(intPreferencesKey("theme_config"))
                     if (dsTheme != null && !spSettings.contains("theme_config")) {
+                        currentThemeConfig = dsTheme
                         _themeConfig.value = dsTheme
                         spSettings.edit().putInt("theme_config", dsTheme).apply()
                     }
@@ -903,6 +1635,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
 
         initMediaController()
+        loadSuggestedPodcasts()
         search()
     }
 
@@ -910,6 +1643,8 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val ctrl = controller ?: return
         val pod = currentPodcast ?: return
         val ep = currentEpisode ?: return
+
+        ctrl.setPlaybackSpeed(getPlaybackSpeedForPodcast(pod))
 
         val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
         val lastPos = statePrefs.getLong("last_position", 0L)
@@ -939,6 +1674,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             .setArtworkUri(Uri.parse(pod.artworkUrl))
             .build()
         val localUri = downloadManager.getLocalUriIfDownloaded(ep.audioUrl)
+            ?: localAudioManager.getLocalUri(ep.audioUrl)
         val playbackUri = localUri ?: Uri.parse(ep.audioUrl)
         val item = MediaItem.Builder()
             .setMediaId(ep.audioUrl)
@@ -960,9 +1696,64 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun clearCurrentPlayback() {
+        val prevEpUrl = currentEpisode?.audioUrl
+        currentEpisode = null
+        currentPodcast = null
+        isPlaying = false
+        currentPosition = 0L
+        duration = 1L
+        currentChapters = emptyList()
+
+        controller?.let {
+            it.stop()
+            it.clearMediaItems()
+        }
+
+        val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+        statePrefs.edit()
+            .remove("last_podcast")
+            .remove("last_episode")
+            .putLong("last_position", 0L)
+            .apply()
+
+        if (prevEpUrl != null) {
+            val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+            posPrefs.edit().remove(prevEpUrl).apply()
+        }
+
+        viewModelScope.launch {
+            app.dataStore.edit { prefs ->
+                prefs.remove(stringPreferencesKey("last_podcast"))
+                prefs.remove(stringPreferencesKey("last_episode"))
+            }
+        }
+        syncWidget()
+    }
+
+    fun stopOrSkipCurrentEpisode() {
+        advanceOrClearCurrentEpisode()
+    }
+
+    private fun advanceOrClearCurrentEpisode() {
+        if (upNextQueue.isNotEmpty()) {
+            val wasPlaying = isPlaying
+            val nextItem = upNextQueue.first()
+            upNextQueue = upNextQueue.drop(1)
+            saveUpNextQueue()
+            playEpisode(nextItem.podcast, nextItem.episode, autoPlay = wasPlaying, fromQueue = isPlayingQueue, keepPreviousInQueue = false)
+        } else {
+            clearCurrentPlayback()
+        }
+    }
+
     fun syncPlaybackState() {
         val ctrl = controller
         if (ctrl != null) {
+            if (ctrl.playbackState == Player.STATE_ENDED && upNextQueue.isEmpty()) {
+                clearCurrentPlayback()
+                return
+            }
             if (ctrl.currentPosition > 0L) {
                 currentPosition = ctrl.currentPosition
             }
@@ -970,6 +1761,10 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 duration = ctrl.duration
             }
             isPlaying = ctrl.isPlaying
+            val targetSpeed = getPlaybackSpeedForPodcast(currentPodcast)
+            if (kotlin.math.abs(ctrl.playbackParameters.speed - targetSpeed) >= 0.02f) {
+                ctrl.setPlaybackSpeed(targetSpeed)
+            }
         } else {
             val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
             val lastPos = statePrefs.getLong("last_position", 0L)
@@ -989,7 +1784,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         syncWidget()
     }
 
-    fun saveCurrentPlaybackPosition() {
+    fun saveCurrentPlaybackPosition(shouldQueueSyncAction: Boolean = false) {
         val ep = currentEpisode ?: return
         val pod = currentPodcast
         val ctrl = controller
@@ -1000,12 +1795,25 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
             statePrefs.edit().putLong("last_position", 0L).apply()
             currentPosition = 0L
+            positionsVersion++
             return
         }
         val pos = if (ctrl != null && ctrl.currentPosition > 0L) ctrl.currentPosition else currentPosition
+        val totalDur = if (ctrl != null && ctrl.duration > 0L) ctrl.duration else if (duration > 1L) duration else parseDurationMs(ep.durationText)
         if (pos > 0L) {
             val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
             posPrefs.edit().putLong(ep.audioUrl, pos).apply()
+            GPodderSyncManager.onPlaybackPositionUpdated(
+                context = app,
+                podcastUrl = pod?.feedUrl,
+                episodeUrl = ep.audioUrl,
+                positionMs = pos,
+                durationMs = totalDur,
+                shouldQueueSyncAction = shouldQueueSyncAction
+            )
+            if (shouldQueueSyncAction) {
+                positionsVersion++
+            }
         }
         if (pod != null) {
             val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
@@ -1020,7 +1828,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        saveCurrentPlaybackPosition()
+        saveCurrentPlaybackPosition(shouldQueueSyncAction = true)
         super.onCleared()
     }
 
@@ -1037,7 +1845,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             controller?.addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(playing: Boolean) {
                     isPlaying = playing
-                    if (!playing) saveCurrentPlaybackPosition()
+                    if (!playing) saveCurrentPlaybackPosition(shouldQueueSyncAction = true)
                     syncWidget()
                 }
                 override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) {
@@ -1049,11 +1857,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     syncWidget()
                     if (playbackState == Player.STATE_ENDED) {
                         val endedEp = currentEpisode
+                        val endedPod = currentPodcast
                         if (endedEp != null) {
-                            markEpisodePlayed(endedEp, true)
                             val shouldKeepUnarchived = keepUnarchivedEpisodes.value.contains(endedEp.audioUrl)
-                            if (autoArchiveEnabled.value && !shouldKeepUnarchived) {
-                                toggleArchive(endedEp, true)
+                            val shouldAutoArchive = autoArchiveEnabled.value && !shouldKeepUnarchived
+                            markEpisodePlayed(endedEp, true, fromPlaybackCompletion = true)
+                            if (shouldAutoArchive) {
+                                toggleArchive(endedEp, true, fromPlaybackCompletion = true)
                             }
                             val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
                             posPrefs.edit().remove(endedEp.audioUrl).apply()
@@ -1067,14 +1877,19 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                             val nextItem = upNextQueue.first()
                             upNextQueue = upNextQueue.drop(1)
                             saveUpNextQueue()
-                            playEpisode(nextItem.podcast, nextItem.episode, autoPlay = true, fromQueue = true)
+                            playEpisode(nextItem.podcast, nextItem.episode, autoPlay = true, fromQueue = true, keepPreviousInQueue = false)
                         } else {
                             if (isPlayingQueue) {
                                 isPlayingQueue = false
                                 playbackNavTarget = PlaybackNavTarget.SubscriptionsHome
                             } else {
+                                if (discoverSelectedPodcast == null && subscriptionSelectedPodcast == null && endedPod != null) {
+                                    subscriptionSelectedPodcast = endedPod
+                                    loadSubscriptionPodcastEpisodes(endedPod)
+                                }
                                 playbackNavTarget = PlaybackNavTarget.EpisodeList
                             }
+                            clearCurrentPlayback()
                         }
                     }
                 }
@@ -1114,44 +1929,220 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private var searchJob: kotlinx.coroutines.Job? = null
+
     fun search() {
-        if (searchQuery.isBlank()) return
-        viewModelScope.launch {
+        val query = searchQuery.trim()
+        if (query.isBlank()) return
+        searchJob?.cancel()
+        searchJob = viewModelScope.launch {
             isLoading = true
             errorMessage = null
             discoverSelectedPodcast = null
             discoverEpisodes = emptyList()
             try {
-                podcasts = NetworkModule.itunesApi.search(searchQuery).results.mapNotNull {
-                    if (it.feedUrl != null && it.collectionName != null) {
-                        Podcast(it.collectionName, it.artistName ?: "Unknown", it.artworkUrl600 ?: "", it.feedUrl)
+                // If the query looks like a direct RSS feed URL, attempt to fetch it directly first
+                if (SecurityUtils.looksLikeFeedUrl(query)) {
+                    when (val feedResult = NetworkModule.fetchPodcastFeedResult(query)) {
+                        is NetworkModule.FeedFetchResult.Success -> {
+                            val parsed = feedResult.parsedFeed
+                            val directPod = Podcast(
+                                title = parsed.channelTitle.ifBlank { "Custom Podcast" },
+                                author = parsed.channelAuthor.ifBlank { "Custom Feed" },
+                                artworkUrl = parsed.channelImage,
+                                feedUrl = feedResult.feedUrl,
+                                description = parsed.channelDescription,
+                                isCustomFeed = true
+                            )
+                            podcasts = listOf(directPod)
+                            isLoading = false
+                            return@launch
+                        }
+                        is NetworkModule.FeedFetchResult.AuthRequired -> {
+                            isLoading = false
+                            openAddCustomFeedDialog(initialUrl = query, forceAuthExpanded = true)
+                            return@launch
+                        }
+                        is NetworkModule.FeedFetchResult.Error -> {
+                            // Fall through to iTunes search or show custom feed option
+                        }
+                    }
+                }
+
+                val results = NetworkModule.itunesApi.search(query).results.orEmpty()
+                val seenFeeds = HashSet<String>()
+                podcasts = results.mapNotNull { item ->
+                    val feedUrl = item?.feedUrl?.trim()
+                    val title = item?.collectionName?.trim()
+                    if (!feedUrl.isNullOrBlank() && !title.isNullOrBlank() && seenFeeds.add(feedUrl)) {
+                        Podcast(
+                            title = title,
+                            author = item.artistName?.trim()?.ifBlank { "Unknown" } ?: "Unknown",
+                            artworkUrl = item.artworkUrl600?.trim() ?: "",
+                            feedUrl = feedUrl
+                        )
                     } else null
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                errorMessage = "Search error: ${e.localizedMessage}"
+                errorMessage = "Search error: ${e.localizedMessage ?: "Unknown error"}"
+            } finally {
+                isLoading = false
             }
-            isLoading = false
         }
     }
 
     fun clearSearch() {
+        searchJob?.cancel()
         searchQuery = ""
         podcasts = emptyList()
         discoverSelectedPodcast = null
         discoverEpisodes = emptyList()
         errorMessage = null
+        isLoading = false
+        if (!hasLoadedOnlineSuggestions && !isLoadingSuggestions) {
+            loadSuggestedPodcasts()
+        }
+    }
+
+    fun loadSuggestedPodcasts(forceRefresh: Boolean = false) {
+        if ((!forceRefresh && hasLoadedOnlineSuggestions) || isLoadingSuggestions) return
+        viewModelScope.launch {
+            isLoadingSuggestions = true
+            val currentUrls = suggestedPodcasts.map { it.feedUrl }.toSet()
+            try {
+                suggestionTopicIndex = (suggestionTopicIndex + 1) % generalSuggestionTopics.size
+                techTopicIndex = (techTopicIndex + 1) % techSuggestionTopics.size
+                val generalTopic = generalSuggestionTopics[suggestionTopicIndex]
+                val techTopic = techSuggestionTopics[techTopicIndex]
+
+                val generalDeferred = async { NetworkModule.itunesApi.searchWithLimit(generalTopic, 30).results.orEmpty() }
+                val techDeferred = async { NetworkModule.itunesApi.searchWithLimit(techTopic, 30).results.orEmpty() }
+
+                val generalResults = generalDeferred.await()
+                val techResults = techDeferred.await()
+
+                fun mapItems(items: List<ItunesItem?>, seen: HashSet<String>): List<Podcast> {
+                    return items.mapNotNull { item ->
+                        val feedUrl = item?.feedUrl?.trim()
+                        val title = item?.collectionName?.trim()
+                        if (!feedUrl.isNullOrBlank() && !title.isNullOrBlank() && seen.add(feedUrl)) {
+                            Podcast(
+                                title = title,
+                                author = item.artistName?.trim()?.ifBlank { "Unknown" } ?: "Unknown",
+                                artworkUrl = item.artworkUrl600?.trim() ?: "",
+                                feedUrl = feedUrl
+                            )
+                        } else null
+                    }
+                }
+
+                val seenFeeds = HashSet<String>()
+                val parsedTech = mapItems(techResults, seenFeeds)
+                val parsedGeneral = mapItems(generalResults, seenFeeds)
+
+                val techPool = if (forceRefresh) {
+                    val unseen = parsedTech.filterNot { currentUrls.contains(it.feedUrl) }
+                    if (unseen.size >= 6) unseen.shuffled() else parsedTech.shuffled()
+                } else {
+                    parsedTech
+                }
+                val generalPool = if (forceRefresh) {
+                    val unseen = parsedGeneral.filterNot { currentUrls.contains(it.feedUrl) }
+                    if (unseen.size >= 6) unseen.shuffled() else parsedGeneral.shuffled()
+                } else {
+                    parsedGeneral
+                }
+
+                // Interleave tech podcasts with general podcasts so tech shows are always mixed in
+                val mixed = mutableListOf<Podcast>()
+                val maxLen = maxOf(techPool.size, generalPool.size)
+                for (i in 0 until maxLen) {
+                    if (i < techPool.size) mixed.add(techPool[i])
+                    if (i < generalPool.size) mixed.add(generalPool[i])
+                }
+
+                if (mixed.isNotEmpty()) {
+                    suggestedPodcasts = mixed.take(24)
+                    hasLoadedOnlineSuggestions = true
+                } else if (forceRefresh) {
+                    suggestedPodcasts = suggestedPodcasts.shuffled()
+                }
+            } catch (_: Exception) {
+                if (forceRefresh && suggestedPodcasts.size > 1) {
+                    var reshuffled = suggestedPodcasts.shuffled()
+                    if (reshuffled == suggestedPodcasts) {
+                        reshuffled = suggestedPodcasts.reversed()
+                    }
+                    suggestedPodcasts = reshuffled
+                }
+            } finally {
+                isLoadingSuggestions = false
+            }
+        }
+    }
+
+    fun refreshSuggestedPodcasts() {
+        loadSuggestedPodcasts(forceRefresh = true)
     }
 
     fun getSavedPosition(audioUrl: String): Long {
+        // Observe positionsVersion so Compose recomposes when positions are updated via playback or gPodder sync
+        @Suppress("UNUSED_VARIABLE")
+        val rev = positionsVersion
         val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
         return posPrefs.getLong(audioUrl, 0L)
     }
 
+    fun getEpisodeDurationMs(episode: Episode): Long {
+        @Suppress("UNUSED_VARIABLE")
+        val rev = positionsVersion
+        val parsed = parseDurationMs(episode.durationText)
+        if (parsed > 0L) return parsed
+        return GPodderSyncManager.getSavedDurationMs(app, episode.audioUrl)
+    }
+
+    fun onGPodderSyncCompleted() {
+        positionsVersion++
+        val ep = currentEpisode
+        if (ep != null && !isPlaying) {
+            val played = playedEpisodes.value
+            val archived = archivedEpisodes.value
+            if (played.contains(ep.audioUrl) || archived.contains(ep.audioUrl)) {
+                clearCurrentPlayback()
+            } else {
+                val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+                val syncedPos = posPrefs.getLong(ep.audioUrl, 0L)
+                if (syncedPos != currentPosition) {
+                    currentPosition = syncedPos
+                    controller?.let { ctrl ->
+                        if (!ctrl.isPlaying && ctrl.currentMediaItem?.mediaId == ep.audioUrl) {
+                            ctrl.seekTo(syncedPos)
+                        }
+                    }
+                }
+            }
+        }
+        refreshSubscriptionFeedsInBackground(subscriptions.value)
+        syncWidget()
+    }
+
     fun loadSubscriptionPodcastEpisodes(podcast: Podcast) {
+        if (LocalAudioManager.isLocalPodcast(podcast)) {
+            val localPod = localAudioManager.buildLocalPodcast()
+            val eps = localAudioManager.getEpisodes()
+            subscriptionSelectedPodcast = localPod
+            subscriptionEpisodes = eps
+            recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, eps)
+            isLoading = false
+            return
+        }
         subscriptionSelectedPodcast = podcast
         val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
         if (cached != null && cached.episodes.isNotEmpty()) {
             subscriptionEpisodes = cached.episodes
+            recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
             isLoading = false
         } else {
             isLoading = true
@@ -1161,6 +2152,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
             if (parsed != null) {
                 subscriptionEpisodes = parsed.episodes
+                recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
                 val updatedPodcast = podcast.copy(
                     title = if (parsed.channelTitle.isNotBlank()) parsed.channelTitle else podcast.title,
                     author = if (parsed.channelAuthor.isNotBlank()) parsed.channelAuthor else podcast.author,
@@ -1216,6 +2208,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
         if (cached != null && cached.episodes.isNotEmpty()) {
             discoverEpisodes = cached.episodes
+            recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
             isLoading = false
         } else {
             isLoading = true
@@ -1225,6 +2218,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
             if (parsed != null) {
                 discoverEpisodes = parsed.episodes
+                recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
                 discoverSelectedPodcast = podcast.copy(
                     title = if (parsed.channelTitle.isNotBlank()) parsed.channelTitle else podcast.title,
                     author = if (parsed.channelAuthor.isNotBlank()) parsed.channelAuthor else podcast.author,
@@ -1242,12 +2236,43 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         loadSubscriptionPodcastEpisodes(podcast)
     }
 
-    fun playEpisode(podcast: Podcast, episode: Episode, autoPlay: Boolean = false, fromQueue: Boolean = false) {
+    fun playEpisode(
+        podcast: Podcast,
+        episode: Episode,
+        autoPlay: Boolean = false,
+        fromQueue: Boolean = false,
+        keepPreviousInQueue: Boolean = true
+    ) {
+        val prevPodcast = currentPodcast
+        val prevEpisode = currentEpisode
+
         isPlayingQueue = fromQueue
         saveCurrentPlaybackPosition()
 
         currentPodcast = podcast
         currentEpisode = episode
+
+        val filteredQueue = upNextQueue.filterNot {
+            it.episode.audioUrl == episode.audioUrl ||
+                (keepPreviousInQueue && prevEpisode != null && it.episode.audioUrl == prevEpisode.audioUrl)
+        }
+        val shouldPushPreviousToQueue = keepPreviousInQueue &&
+            prevPodcast != null &&
+            prevEpisode != null &&
+            prevEpisode.audioUrl.isNotBlank() &&
+            prevEpisode.audioUrl != episode.audioUrl &&
+            !playedEpisodes.value.contains(prevEpisode.audioUrl) &&
+            !archivedEpisodes.value.contains(prevEpisode.audioUrl)
+
+        val updatedQueue = if (shouldPushPreviousToQueue && prevPodcast != null && prevEpisode != null) {
+            listOf(QueueItem(prevPodcast, prevEpisode)) + filteredQueue
+        } else {
+            filteredQueue
+        }
+        if (updatedQueue != upNextQueue) {
+            upNextQueue = updatedQueue
+            saveUpNextQueue()
+        }
 
         val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
         statePrefs.edit()
@@ -1269,6 +2294,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             .build()
 
         val localUri = downloadManager.getLocalUriIfDownloaded(episode.audioUrl)
+            ?: localAudioManager.getLocalUri(episode.audioUrl)
         val playbackUri = localUri ?: Uri.parse(episode.audioUrl)
 
         val item = MediaItem.Builder()
@@ -1300,7 +2326,9 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             }
         }
 
+        val targetSpeed = getPlaybackSpeedForPodcast(podcast)
         controller?.apply {
+            setPlaybackSpeed(targetSpeed)
             if (savedPos > 0L) {
                 setMediaItem(item, savedPos)
             } else {
@@ -1317,11 +2345,15 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun playDownloadedEpisode(downloaded: DownloadedEpisode, autoPlay: Boolean = false) {
+        val matchedSub = subscriptions.value.find {
+            it.title.trim().equals(downloaded.podcastTitle.trim(), ignoreCase = true) ||
+                (downloaded.podcastArtworkUrl.isNotBlank() && it.artworkUrl == downloaded.podcastArtworkUrl)
+        }
         val podcast = Podcast(
             title = downloaded.podcastTitle,
-            author = "Downloaded",
-            artworkUrl = downloaded.podcastArtworkUrl,
-            feedUrl = ""
+            author = matchedSub?.author?.ifBlank { "Downloaded" } ?: "Downloaded",
+            artworkUrl = downloaded.podcastArtworkUrl.ifBlank { matchedSub?.artworkUrl ?: "" },
+            feedUrl = matchedSub?.feedUrl ?: ""
         )
         val episode = Episode(
             title = downloaded.episodeTitle,
@@ -1338,9 +2370,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun downloadAllEpisodes(podcast: Podcast, episodes: List<Episode>) {
-        episodes.forEach { episode ->
-            downloadEpisode(podcast, episode)
-        }
+        downloadManager.downloadEpisodes(podcast, episodes)
     }
 
     fun cancelDownload(audioUrl: String) {
@@ -1357,6 +2387,230 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun getFormattedDownloadSize(audioUrl: String): String? {
         return downloadManager.getFormattedSize(audioUrl)
+            ?: localAudioManager.getFormattedSize(audioUrl)
+    }
+
+    private fun persistLocalPodcastInSubscriptions(localPod: Podcast) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    val json = prefs[stringPreferencesKey("subscriptions")]
+                    var current: MutableList<Podcast> = SubscriptionStorageManager.parseSubscriptionsJson(json).toMutableList()
+                    if (current.isEmpty()) {
+                        val backup = SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+                        if (backup.isNotEmpty()) current = backup.toMutableList()
+                    }
+                    val idx = current.indexOfFirst { LocalAudioManager.isLocalPodcast(it) }
+                    if (idx >= 0) {
+                        current[idx] = localPod
+                    } else {
+                        current.add(0, localPod)
+                    }
+                    val updatedJson = Gson().toJson(current)
+                    prefs[stringPreferencesKey("subscriptions")] = updatedJson
+                    SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun removeLocalPodcastFromSubscriptions() {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    val json = prefs[stringPreferencesKey("subscriptions")]
+                    var current: MutableList<Podcast> = SubscriptionStorageManager.parseSubscriptionsJson(json).toMutableList()
+                    if (current.isEmpty()) {
+                        val backup = SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+                        if (backup.isNotEmpty()) current = backup.toMutableList()
+                    }
+                    if (current.removeAll { LocalAudioManager.isLocalPodcast(it) }) {
+                        val updatedJson = Gson().toJson(current)
+                        prefs[stringPreferencesKey("subscriptions")] = updatedJson
+                        if (current.isEmpty()) {
+                            SubscriptionStorageManager.recordExplicitEmpty(app)
+                        } else {
+                            SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun importLocalAudioFiles(uris: List<Uri>, onComplete: (Int) -> Unit = {}) {
+        viewModelScope.launch {
+            val added = localAudioManager.importAudioUris(uris)
+            if (added.isNotEmpty()) {
+                val eps = localAudioManager.getEpisodes()
+                recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, eps)
+                val localPod = localAudioManager.buildLocalPodcast()
+                if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+                    subscriptionSelectedPodcast = localPod
+                    subscriptionEpisodes = eps
+                }
+                persistLocalPodcastInSubscriptions(localPod)
+            }
+            onComplete(added.size)
+        }
+    }
+
+    fun renameLocalAudioFile(fileId: String, newTitle: String) {
+        val updatedFile = localAudioManager.renameAudioFile(fileId, newTitle) ?: return
+        val eps = localAudioManager.getEpisodes()
+        recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, eps)
+        if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+            subscriptionEpisodes = eps
+        }
+        if (currentEpisode?.audioUrl == updatedFile.audioUrl) {
+            val updatedEp = currentEpisode!!.copy(title = updatedFile.title)
+            currentEpisode = updatedEp
+            val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            statePrefs.edit().putString("last_episode", appGson.toJson(updatedEp)).apply()
+            viewModelScope.launch {
+                try {
+                    app.dataStore.edit { it[stringPreferencesKey("last_episode")] = appGson.toJson(updatedEp) }
+                } catch (_: Exception) {}
+            }
+            syncWidget()
+        }
+        if (upNextQueue.any { it.episode.audioUrl == updatedFile.audioUrl }) {
+            upNextQueue = upNextQueue.map { q ->
+                if (q.episode.audioUrl == updatedFile.audioUrl) {
+                    q.copy(episode = q.episode.copy(title = updatedFile.title))
+                } else q
+            }
+            saveUpNextQueue()
+            syncWidget()
+        }
+    }
+
+    fun deleteLocalAudioFile(fileId: String) {
+        val removed = localAudioManager.deleteAudioFile(fileId) ?: return
+        val audioUrl = removed.audioUrl
+        if (currentEpisode?.audioUrl == audioUrl) {
+            advanceOrClearCurrentEpisode()
+        }
+        if (upNextQueue.any { it.episode.audioUrl == audioUrl }) {
+            removeFromUpNextByUrl(audioUrl)
+        }
+        val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+        posPrefs.edit().remove(audioUrl).apply()
+
+        val remainingEps = localAudioManager.getEpisodes()
+        recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, remainingEps)
+        if (remainingEps.isEmpty()) {
+            if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+                subscriptionSelectedPodcast = null
+                subscriptionEpisodes = emptyList()
+            }
+            removeLocalPodcastFromSubscriptions()
+        } else {
+            val localPod = localAudioManager.buildLocalPodcast()
+            if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+                subscriptionSelectedPodcast = localPod
+                subscriptionEpisodes = remainingEps
+            }
+            persistLocalPodcastInSubscriptions(localPod)
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                    val archKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                    val keepKey = androidx.datastore.preferences.core.stringSetPreferencesKey("keep_unarchived_episodes")
+                    prefs[playedKey]?.let { prefs[playedKey] = it - audioUrl }
+                    prefs[archKey]?.let { prefs[archKey] = it - audioUrl }
+                    prefs[keepKey]?.let { prefs[keepKey] = it - audioUrl }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun deleteAllLocalAudioFiles() {
+        val removedList = localAudioManager.deleteAllAudioFiles()
+        val removedUrls = removedList.map { it.audioUrl }.toSet()
+        if (currentEpisode != null && removedUrls.contains(currentEpisode?.audioUrl)) {
+            advanceOrClearCurrentEpisode()
+        }
+        if (upNextQueue.any { removedUrls.contains(it.episode.audioUrl) }) {
+            upNextQueue = upNextQueue.filterNot { removedUrls.contains(it.episode.audioUrl) }
+            saveUpNextQueue()
+            syncWidget()
+        }
+        if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+            subscriptionSelectedPodcast = null
+            subscriptionEpisodes = emptyList()
+        }
+        recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, emptyList())
+        removeLocalPodcastFromSubscriptions()
+
+        val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+        val posEdit = posPrefs.edit()
+        removedUrls.forEach { posEdit.remove(it) }
+        posEdit.apply()
+
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                    val archKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                    val keepKey = androidx.datastore.preferences.core.stringSetPreferencesKey("keep_unarchived_episodes")
+                    prefs[playedKey]?.let { prefs[playedKey] = it - removedUrls }
+                    prefs[archKey]?.let { prefs[archKey] = it - removedUrls }
+                    prefs[keepKey]?.let { prefs[keepKey] = it - removedUrls }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun updateLocalSubscriptionTitle(newTitle: String) {
+        localAudioManager.updateSubscriptionTitle(newTitle)
+        val localPod = localAudioManager.buildLocalPodcast(localAudioManager.subscriptionTitle.value)
+        if (LocalAudioManager.isLocalPodcast(subscriptionSelectedPodcast)) {
+            subscriptionSelectedPodcast = localPod
+        }
+        if (LocalAudioManager.isLocalPodcast(currentPodcast)) {
+            currentPodcast = localPod
+            val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            statePrefs.edit().putString("last_podcast", appGson.toJson(localPod)).apply()
+            viewModelScope.launch {
+                try {
+                    app.dataStore.edit { it[stringPreferencesKey("last_podcast")] = appGson.toJson(localPod) }
+                } catch (_: Exception) {}
+            }
+            syncWidget()
+        }
+        if (upNextQueue.any { LocalAudioManager.isLocalPodcast(it.podcast) }) {
+            upNextQueue = upNextQueue.map { q ->
+                if (LocalAudioManager.isLocalPodcast(q.podcast)) {
+                    q.copy(podcast = localPod)
+                } else q
+            }
+            saveUpNextQueue()
+            syncWidget()
+        }
+        if (localAudioFiles.value.isNotEmpty()) {
+            persistLocalPodcastInSubscriptions(localPod)
+        }
+    }
+
+    fun playLocalAudioFile(file: LocalAudioFile, autoPlay: Boolean = true) {
+        val localPod = localAudioManager.buildLocalPodcast()
+        val episode = file.toEpisode()
+        playEpisode(localPod, episode, autoPlay = autoPlay)
+    }
+
+    fun openLocalAudioInSubscriptions() {
+        if (localAudioFiles.value.isEmpty()) return
+        val localPod = localAudioManager.buildLocalPodcast()
+        val eps = localAudioManager.getEpisodes()
+        discoverSelectedPodcast = null
+        subscriptionSelectedPodcast = localPod
+        subscriptionEpisodes = eps
+        recordFeedEpisodesForBadges(LocalAudioManager.LOCAL_FEED_URL, eps)
+        playbackNavTarget = PlaybackNavTarget.EpisodeList
     }
 
     fun setNotificationsEnabled(enabled: Boolean) {
@@ -1404,6 +2658,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun addToUpNext(podcast: Podcast, episode: Episode) {
+        if (currentEpisode?.audioUrl == episode.audioUrl) return
         val filtered = upNextQueue.filterNot { it.episode.audioUrl == episode.audioUrl }
         // Place next in line after currently playing episode (at the top of the queue)
         upNextQueue = listOf(QueueItem(podcast, episode)) + filtered
@@ -1562,11 +2817,10 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             // 1. Podcasting 2.0 Chapters JSON
             if (episode.chaptersUrl.isNotBlank() && SecurityUtils.isSafeWebUrl(episode.chaptersUrl)) {
                 try {
-                    val req = Request.Builder()
-                        .url(episode.chaptersUrl)
-                        .header("User-Agent", "ExpressoPod/1.0")
-                        .build()
-                    NetworkModule.okHttp.newCall(req).execute().use { resp ->
+                    NetworkModule.executeAuthenticatedCall(
+                        url = episode.chaptersUrl,
+                        feedUrl = currentPodcast?.feedUrl
+                    ).use { resp ->
                         if (resp.isSuccessful) {
                             val body = resp.body?.string()
                             if (!body.isNullOrBlank()) {
@@ -1649,11 +2903,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 artUrl = artUrl,
                 queueJson = queueJson
             )
-            PodcastWidget().updateAll(app)
+            app.updateAllPodcastWidgets()
         }
     }
 
     fun updateTheme(theme: Int) {
+        if (currentThemeConfig == theme && _themeConfig.value == theme) return
+        currentThemeConfig = theme
         _themeConfig.value = theme
         app.getSharedPreferences("expressopod_settings", Context.MODE_PRIVATE)
             .edit()
@@ -1676,7 +2932,11 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun toggleArchive(episode: Episode, archive: Boolean) {
+    fun toggleArchive(episode: Episode, archive: Boolean, fromPlaybackCompletion: Boolean = false) {
+        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        if (archive && !fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
+            advanceOrClearCurrentEpisode()
+        }
         viewModelScope.launch {
             if (archive) {
                 deleteDownload(episode.audioUrl)
@@ -1684,9 +2944,31 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             app.dataStore.edit { prefs ->
                 val key = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
                 val current = prefs[key]?.toMutableSet() ?: mutableSetOf()
-                if (archive) current.add(episode.audioUrl) else current.remove(episode.audioUrl)
+                val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                val currentPlayed = prefs[playedKey]?.toMutableSet() ?: mutableSetOf()
+                if (archive) {
+                    current.add(episode.audioUrl)
+                    if (fromPlaybackCompletion) {
+                        currentPlayed.add(episode.audioUrl)
+                        prefs[playedKey] = currentPlayed
+                    }
+                } else {
+                    current.remove(episode.audioUrl)
+                    // When an episode is unarchived, mark it as unplayed
+                    if (currentPlayed.remove(episode.audioUrl)) {
+                        prefs[playedKey] = currentPlayed
+                    }
+                }
                 prefs[key] = current
             }
+            GPodderSyncManager.onEpisodeArchiveStateChanged(
+                context = app,
+                podcastUrl = activePodcastUrl,
+                episodeUrl = episode.audioUrl,
+                archived = archive,
+                fromPlaybackCompletion = fromPlaybackCompletion,
+                durationMs = parseDurationMs(episode.durationText)
+            )
         }
     }
 
@@ -1699,11 +2981,16 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     current.remove(episode.audioUrl)
                 } else {
                     current.add(episode.audioUrl)
-                    // If episode was previously archived, unarchive it
+                    // If episode was previously archived, unarchive it and mark it as unplayed
                     val archiveKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
                     val archivedSet = prefs[archiveKey]?.toMutableSet()
                     if (archivedSet != null && archivedSet.remove(episode.audioUrl)) {
                         prefs[archiveKey] = archivedSet
+                        val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                        val playedSet = prefs[playedKey]?.toMutableSet()
+                        if (playedSet != null && playedSet.remove(episode.audioUrl)) {
+                            prefs[playedKey] = playedSet
+                        }
                     }
                 }
                 prefs[key] = current
@@ -1712,9 +2999,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun archiveAllEpisodes(episodes: List<Episode>) {
+        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        val pinned = keepUnarchivedEpisodes.value
+        val unpinnedEpisodes = episodes.filter { !pinned.contains(it.audioUrl) }
+        if (currentEpisode != null && unpinnedEpisodes.any { it.audioUrl == currentEpisode?.audioUrl }) {
+            advanceOrClearCurrentEpisode()
+        }
         viewModelScope.launch {
-            val pinned = keepUnarchivedEpisodes.value
-            val unpinnedEpisodes = episodes.filter { !pinned.contains(it.audioUrl) }
             unpinnedEpisodes.forEach { ep ->
                 deleteDownload(ep.audioUrl)
             }
@@ -1730,23 +3021,55 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
                 prefs[key] = current
             }
-        }
-    }
-
-    fun unarchiveAllEpisodes(episodes: List<Episode>) {
-        viewModelScope.launch {
-            app.dataStore.edit { prefs ->
-                val key = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
-                val current = prefs[key]?.toMutableSet() ?: mutableSetOf()
-                episodes.forEach { ep ->
-                    current.remove(ep.audioUrl)
+            unpinnedEpisodes.forEach { ep ->
+                if (ep.audioUrl.isNotBlank()) {
+                    GPodderSyncManager.onEpisodeArchiveStateChanged(
+                        context = app,
+                        podcastUrl = activePodcastUrl,
+                        episodeUrl = ep.audioUrl,
+                        archived = true,
+                        durationMs = parseDurationMs(ep.durationText)
+                    )
                 }
-                prefs[key] = current
             }
         }
     }
 
-    fun markEpisodePlayed(episode: Episode, played: Boolean) {
+    fun unarchiveAllEpisodes(episodes: List<Episode>) {
+        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        viewModelScope.launch {
+            app.dataStore.edit { prefs ->
+                val key = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                val current = prefs[key]?.toMutableSet() ?: mutableSetOf()
+                val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                val currentPlayed = prefs[playedKey]?.toMutableSet() ?: mutableSetOf()
+                episodes.forEach { ep ->
+                    current.remove(ep.audioUrl)
+                    currentPlayed.remove(ep.audioUrl)
+                }
+                prefs[key] = current
+                prefs[playedKey] = currentPlayed
+            }
+            episodes.forEach { ep ->
+                if (ep.audioUrl.isNotBlank()) {
+                    GPodderSyncManager.onEpisodeArchiveStateChanged(
+                        context = app,
+                        podcastUrl = activePodcastUrl,
+                        episodeUrl = ep.audioUrl,
+                        archived = false,
+                        durationMs = parseDurationMs(ep.durationText)
+                    )
+                }
+            }
+        }
+    }
+
+    fun markEpisodePlayed(episode: Episode, played: Boolean, fromPlaybackCompletion: Boolean = false) {
+        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        val epDurationMs = parseDurationMs(episode.durationText).let { if (it > 0L) it else if (currentEpisode?.audioUrl == episode.audioUrl && duration > 1L) duration else 0L }
+        if (played && !fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
+            advanceOrClearCurrentEpisode()
+        }
         viewModelScope.launch {
             app.dataStore.edit { prefs ->
                 val key = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
@@ -1765,6 +3088,14 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
                 prefs[key] = current
             }
+            positionsVersion++
+            GPodderSyncManager.onEpisodePlayedStateChanged(
+                context = app,
+                podcastUrl = activePodcastUrl,
+                episodeUrl = episode.audioUrl,
+                played = played,
+                durationMs = epDurationMs
+            )
         }
     }
 
@@ -1785,6 +3116,12 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     fun setShowRemainingTime(enabled: Boolean) {
         viewModelScope.launch {
             app.dataStore.edit { it[booleanPreferencesKey("show_remaining_time")] = enabled }
+        }
+    }
+
+    fun setShowMiniPlayer(enabled: Boolean) {
+        viewModelScope.launch {
+            app.dataStore.edit { it[booleanPreferencesKey("show_mini_player")] = enabled }
         }
     }
 
@@ -1810,6 +3147,18 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun setShowUnplayedBadge(enabled: Boolean) {
+        viewModelScope.launch {
+            app.dataStore.edit { it[booleanPreferencesKey("show_unplayed_badge")] = enabled }
+        }
+    }
+
+    fun setShowDownloadedBadge(enabled: Boolean) {
+        viewModelScope.launch {
+            app.dataStore.edit { it[booleanPreferencesKey("show_downloaded_badge")] = enabled }
+        }
+    }
+
     private val _episodeListScrollPositions = mutableMapOf<String, Pair<Int, Int>>()
 
     fun saveEpisodeListPosition(feedUrl: String, index: Int, offset: Int) {
@@ -1828,12 +3177,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 it[intPreferencesKey("rewind_sec")] = newRewind
                 it[intPreferencesKey("forward_sec")] = newForward
             }
-            PodcastWidget().updateAll(app)
+            app.updateAllPodcastWidgets()
         }
     }
 
     fun toggleSubscription(podcast: Podcast) {
         viewModelScope.launch {
+            var wasRemoved = false
             app.dataStore.edit { prefs ->
                 val json = prefs[stringPreferencesKey("subscriptions")]
                 var current: MutableList<Podcast> = SubscriptionStorageManager.parseSubscriptionsJson(json).toMutableList()
@@ -1844,8 +3194,10 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
                 if (current.any { it.feedUrl == podcast.feedUrl }) {
                     current.removeAll { it.feedUrl == podcast.feedUrl }
+                    wasRemoved = true
                 } else {
                     current.add(podcast)
+                    wasRemoved = false
                 }
                 val updatedJson = Gson().toJson(current)
                 prefs[stringPreferencesKey("subscriptions")] = updatedJson
@@ -1855,7 +3207,101 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
                 }
             }
+            if (wasRemoved) {
+                GPodderSyncManager.onSubscriptionRemoved(app, podcast.feedUrl)
+            } else {
+                GPodderSyncManager.onSubscriptionAdded(app, podcast.feedUrl)
+            }
         }
+    }
+
+    suspend fun addOrUpdateCustomFeed(
+        rawUrl: String,
+        username: String,
+        password: String,
+        existingPodcast: Podcast? = null,
+        navigateOnSuccess: Boolean = true
+    ): NetworkModule.FeedFetchResult {
+        val normalized = SecurityUtils.normalizeFeedUrl(rawUrl)
+            ?: return NetworkModule.FeedFetchResult.Error("Please enter a valid RSS feed URL (http:// or https://).")
+        val (cleanUrl, embeddedCreds) = FeedCredentialsManager.extractEmbeddedCredentials(normalized)
+        val finalUser = username.trim().ifBlank { embeddedCreds?.username ?: "" }
+        val finalPass = if (username.isNotBlank() || password.isNotBlank()) password else (embeddedCreds?.password ?: "")
+
+        val fetchResult = NetworkModule.fetchPodcastFeedResult(
+            rawFeedUrl = cleanUrl,
+            username = finalUser.ifBlank { null },
+            password = finalPass.ifBlank { null }
+        )
+
+        if (fetchResult is NetworkModule.FeedFetchResult.Success) {
+            val resolvedFeedUrl = fetchResult.feedUrl
+            val parsed = fetchResult.parsedFeed
+
+            FeedCredentialsManager.saveCredentials(app, resolvedFeedUrl, finalUser, finalPass)
+            if (parsed.episodes.isNotEmpty()) {
+                FeedCredentialsManager.registerEpisodesForFeed(app, resolvedFeedUrl, parsed.episodes.map { it.audioUrl })
+                recordFeedEpisodesForBadges(resolvedFeedUrl, parsed.episodes)
+            }
+
+            val updatedPodcast = Podcast(
+                title = parsed.channelTitle.ifBlank { existingPodcast?.title?.ifBlank { "Custom Podcast" } ?: "Custom Podcast" },
+                author = parsed.channelAuthor.ifBlank { existingPodcast?.author?.ifBlank { "Private Feed" } ?: "Private Feed" },
+                artworkUrl = parsed.channelImage.ifBlank { existingPodcast?.artworkUrl ?: "" },
+                feedUrl = resolvedFeedUrl,
+                description = parsed.channelDescription.ifBlank { existingPodcast?.description ?: "" },
+                isCustomFeed = existingPodcast?.isCustomFeed ?: true
+            )
+
+            app.dataStore.edit { prefs ->
+                val json = prefs[stringPreferencesKey("subscriptions")]
+                var current: MutableList<Podcast> = SubscriptionStorageManager.parseSubscriptionsJson(json).toMutableList()
+                if (current.isEmpty()) {
+                    val backup = SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+                    if (backup.isNotEmpty()) current = backup.toMutableList()
+                }
+
+                val existingIdx = current.indexOfFirst {
+                    it.feedUrl == resolvedFeedUrl || (existingPodcast != null && it.feedUrl == existingPodcast.feedUrl)
+                }
+                if (existingIdx != -1) {
+                    current[existingIdx] = updatedPodcast
+                } else {
+                    current.add(0, updatedPodcast)
+                }
+
+                val updatedJson = Gson().toJson(current)
+                prefs[stringPreferencesKey("subscriptions")] = updatedJson
+                SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
+            }
+            GPodderSyncManager.onSubscriptionAdded(app, resolvedFeedUrl)
+
+            if (subscriptionSelectedPodcast?.feedUrl == resolvedFeedUrl ||
+                (existingPodcast != null && subscriptionSelectedPodcast?.feedUrl == existingPodcast.feedUrl)
+            ) {
+                subscriptionSelectedPodcast = updatedPodcast
+                subscriptionEpisodes = parsed.episodes
+            }
+            if (discoverSelectedPodcast?.feedUrl == resolvedFeedUrl ||
+                (existingPodcast != null && discoverSelectedPodcast?.feedUrl == existingPodcast.feedUrl)
+            ) {
+                discoverSelectedPodcast = updatedPodcast
+                discoverEpisodes = parsed.episodes
+            }
+
+            if (navigateOnSuccess && existingPodcast == null) {
+                discoverSelectedPodcast = null
+                subscriptionSelectedPodcast = updatedPodcast
+                subscriptionEpisodes = parsed.episodes
+                playbackNavTarget = PlaybackNavTarget.EpisodeList
+            }
+        }
+
+        return fetchResult
+    }
+
+    fun removeFeedCredentials(podcast: Podcast) {
+        FeedCredentialsManager.removeCredentials(app, podcast.feedUrl)
     }
 
     fun updateSubscriptionOrder(newOrder: List<Podcast>) {
@@ -1887,7 +3333,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     xmlSerializer.endTag(null, "head")
                     xmlSerializer.startTag(null, "body")
 
-                    val currentSubs = subscriptions.value
+                    val currentSubs = subscriptions.value.filterNot { LocalAudioManager.isLocalPodcast(it) }
                     for (pod in currentSubs) {
                         xmlSerializer.startTag(null, "outline")
                         xmlSerializer.attribute(null, "text", pod.title)
@@ -1965,10 +3411,71 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     prefs[stringPreferencesKey("subscriptions")] = updatedJson
                     SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
                 }
+                GPodderSyncManager.onSubscriptionsAdded(app, fullSubs.map { it.feedUrl })
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
+    }
+
+    // gPodder Sync Methods
+    fun saveGPodderConfig(
+        enabled: Boolean,
+        serverType: GPodderServerType = gpodderSyncState.value.config.serverType,
+        serverUrl: String,
+        username: String,
+        password: String,
+        intervalMinutes: Int
+    ): GPodderConfig {
+        return GPodderSyncManager.saveConfig(
+            context = app,
+            enabled = enabled,
+            serverType = serverType,
+            serverUrl = serverUrl,
+            username = username,
+            password = password,
+            syncIntervalMinutes = intervalMinutes
+        )
+    }
+
+    fun setGPodderSyncEnabled(enabled: Boolean) {
+        GPodderSyncManager.setSyncEnabled(app, enabled)
+    }
+
+    fun updateGPodderSyncInterval(intervalMinutes: Int) {
+        GPodderSyncManager.updateSyncInterval(app, intervalMinutes)
+    }
+
+    suspend fun testGPodderConnection(
+        serverType: GPodderServerType = gpodderSyncState.value.config.serverType,
+        serverUrl: String,
+        username: String,
+        password: String
+    ): GPodderConnectionTestResult {
+        return GPodderSyncManager.testConnection(
+            context = app,
+            serverType = serverType,
+            rawServerUrl = serverUrl,
+            username = username,
+            password = password,
+            saveOnSuccess = true
+        )
+    }
+
+    fun syncGPodderNow(onResult: (GPodderSyncResult) -> Unit = {}) {
+        saveCurrentPlaybackPosition(shouldQueueSyncAction = true)
+        GPodderSyncManager.syncNowAsync(app) { res ->
+            onGPodderSyncCompleted()
+            onResult(res)
+        }
+    }
+
+    fun disconnectGPodder() {
+        GPodderSyncManager.disconnectServer(app)
+    }
+
+    fun clearGPodderTestResult() {
+        GPodderSyncManager.clearTestResult()
     }
 }
 
@@ -1995,7 +3502,13 @@ class MainActivity : ComponentActivity() {
                             if (epJson != null) {
                                 try { vm.currentEpisode = Gson().fromJson(epJson, Episode::class.java) } catch (_: Exception) {}
                             }
-                            vm.removeFromUpNextByUrl(playedUrl)
+                            if (context != null) {
+                                vm.upNextQueue = QueueStorageManager.loadQueueFromBackup(context)
+                                    .filterNot { it.episode.audioUrl == vm.currentEpisode?.audioUrl }
+                                vm.saveUpNextQueue()
+                            } else {
+                                vm.removeFromUpNextByUrl(playedUrl)
+                            }
                             vm.syncPlaybackState()
                         }
                     }
@@ -2018,6 +3531,9 @@ class MainActivity : ComponentActivity() {
                         viewModelRef?.onChaptersReceived(json)
                     }
                 }
+                GPodderSyncManager.ACTION_GPODDER_SYNC_COMPLETED -> {
+                    viewModelRef?.onGPodderSyncCompleted()
+                }
             }
         }
     }
@@ -2029,6 +3545,7 @@ class MainActivity : ComponentActivity() {
             addAction("com.rpmtech.expressopod.ACTION_QUEUE_CHANGED")
             addAction("com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED")
             addAction("com.rpmtech.expressopod.ACTION_CHAPTERS_UPDATED")
+            addAction(GPodderSyncManager.ACTION_GPODDER_SYNC_COMPLETED)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(playbackAndQueueReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -2042,14 +3559,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             val vm: PodcastViewModel = viewModel()
             viewModelRef = vm
-            val themeConfig by vm.themeConfig.collectAsState()
+            val themeConfig = vm.currentThemeConfig
 
             LaunchedEffect(intent) {
                 handleNotificationIntent(intent, vm)
             }
 
             ExpressivePodcastTheme(themeConfig = themeConfig) {
-                PodcastAppScreen(vm)
+                PodcastAppScreen(vm = vm, themeConfig = themeConfig)
             }
         }
     }
@@ -2116,6 +3633,50 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun lerpColorScheme(start: ColorScheme, stop: ColorScheme, fraction: Float): ColorScheme {
+    val f = fraction.coerceIn(0f, 1f)
+    if (f <= 0f) return start
+    if (f >= 1f) return stop
+    return ColorScheme(
+        primary = lerp(start.primary, stop.primary, f),
+        onPrimary = lerp(start.onPrimary, stop.onPrimary, f),
+        primaryContainer = lerp(start.primaryContainer, stop.primaryContainer, f),
+        onPrimaryContainer = lerp(start.onPrimaryContainer, stop.onPrimaryContainer, f),
+        inversePrimary = lerp(start.inversePrimary, stop.inversePrimary, f),
+        secondary = lerp(start.secondary, stop.secondary, f),
+        onSecondary = lerp(start.onSecondary, stop.onSecondary, f),
+        secondaryContainer = lerp(start.secondaryContainer, stop.secondaryContainer, f),
+        onSecondaryContainer = lerp(start.onSecondaryContainer, stop.onSecondaryContainer, f),
+        tertiary = lerp(start.tertiary, stop.tertiary, f),
+        onTertiary = lerp(start.onTertiary, stop.onTertiary, f),
+        tertiaryContainer = lerp(start.tertiaryContainer, stop.tertiaryContainer, f),
+        onTertiaryContainer = lerp(start.onTertiaryContainer, stop.onTertiaryContainer, f),
+        background = lerp(start.background, stop.background, f),
+        onBackground = lerp(start.onBackground, stop.onBackground, f),
+        surface = lerp(start.surface, stop.surface, f),
+        onSurface = lerp(start.onSurface, stop.onSurface, f),
+        surfaceVariant = lerp(start.surfaceVariant, stop.surfaceVariant, f),
+        onSurfaceVariant = lerp(start.onSurfaceVariant, stop.onSurfaceVariant, f),
+        surfaceTint = lerp(start.surfaceTint, stop.surfaceTint, f),
+        inverseSurface = lerp(start.inverseSurface, stop.inverseSurface, f),
+        inverseOnSurface = lerp(start.inverseOnSurface, stop.inverseOnSurface, f),
+        error = lerp(start.error, stop.error, f),
+        onError = lerp(start.onError, stop.onError, f),
+        errorContainer = lerp(start.errorContainer, stop.errorContainer, f),
+        onErrorContainer = lerp(start.onErrorContainer, stop.onErrorContainer, f),
+        outline = lerp(start.outline, stop.outline, f),
+        outlineVariant = lerp(start.outlineVariant, stop.outlineVariant, f),
+        scrim = lerp(start.scrim, stop.scrim, f),
+        surfaceBright = lerp(start.surfaceBright, stop.surfaceBright, f),
+        surfaceDim = lerp(start.surfaceDim, stop.surfaceDim, f),
+        surfaceContainer = lerp(start.surfaceContainer, stop.surfaceContainer, f),
+        surfaceContainerHigh = lerp(start.surfaceContainerHigh, stop.surfaceContainerHigh, f),
+        surfaceContainerHighest = lerp(start.surfaceContainerHighest, stop.surfaceContainerHighest, f),
+        surfaceContainerLow = lerp(start.surfaceContainerLow, stop.surfaceContainerLow, f),
+        surfaceContainerLowest = lerp(start.surfaceContainerLowest, stop.surfaceContainerLowest, f)
+    )
+}
+
 @Composable
 fun ExpressivePodcastTheme(themeConfig: Int = 0, content: @Composable () -> Unit) {
     val context = LocalContext.current
@@ -2125,28 +3686,42 @@ fun ExpressivePodcastTheme(themeConfig: Int = 0, content: @Composable () -> Unit
         else -> isSystemInDarkTheme()
     }
 
-    val dynamicContext = remember(context, darkTheme) {
+    val (lightScheme, darkScheme) = remember(context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val targetUiMode = if (darkTheme) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
-            val overrideConfig = Configuration(context.resources.configuration).apply {
-                uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or targetUiMode
+            val lightContext = context.createConfigurationContext(
+                Configuration(context.resources.configuration).apply {
+                    uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or Configuration.UI_MODE_NIGHT_NO
+                }
+            )
+            val darkContext = context.createConfigurationContext(
+                Configuration(context.resources.configuration).apply {
+                    uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or Configuration.UI_MODE_NIGHT_YES
+                }
+            )
+            val light = try {
+                dynamicLightColorScheme(lightContext)
+            } catch (_: Exception) {
+                lightColorScheme()
             }
-            context.createConfigurationContext(overrideConfig)
+            val dark = try {
+                dynamicDarkColorScheme(darkContext)
+            } catch (_: Exception) {
+                darkColorScheme()
+            }
+            light to dark
         } else {
-            context
+            lightColorScheme() to darkColorScheme()
         }
     }
 
-    val colorScheme = remember(darkTheme, dynamicContext) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            try {
-                if (darkTheme) dynamicDarkColorScheme(dynamicContext) else dynamicLightColorScheme(dynamicContext)
-            } catch (_: Exception) {
-                if (darkTheme) darkColorScheme() else lightColorScheme()
-            }
-        } else {
-            if (darkTheme) darkColorScheme() else lightColorScheme()
-        }
+    val themeFraction by animateFloatAsState(
+        targetValue = if (darkTheme) 1f else 0f,
+        animationSpec = tween(durationMillis = 350, easing = FastOutSlowInEasing),
+        label = "ThemeFadeFraction"
+    )
+
+    val colorScheme = remember(lightScheme, darkScheme, themeFraction) {
+        lerpColorScheme(lightScheme, darkScheme, themeFraction)
     }
 
     val view = LocalView.current
@@ -2154,23 +3729,9 @@ fun ExpressivePodcastTheme(themeConfig: Int = 0, content: @Composable () -> Unit
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             view.isForceDarkAllowed = false
         }
-        val activity = context as? ComponentActivity
         SideEffect {
-            if (activity != null) {
-                activity.enableEdgeToEdge(
-                    statusBarStyle = if (darkTheme) {
-                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
-                    } else {
-                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
-                    },
-                    navigationBarStyle = if (darkTheme) {
-                        SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
-                    } else {
-                        SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT)
-                    }
-                )
-            } else if (context is Activity) {
-                val window = context.window
+            val window = (context as? Activity)?.window
+            if (window != null) {
                 val insetsController = WindowCompat.getInsetsController(window, view)
                 insetsController.isAppearanceLightStatusBars = !darkTheme
                 insetsController.isAppearanceLightNavigationBars = !darkTheme
@@ -2222,10 +3783,68 @@ fun rememberIs3ButtonNavigation(): Boolean {
     }
 }
 
+fun View.performSubtleHaptic() {
+    if (!performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)) {
+        performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+    }
+}
+
+@Composable
+fun rememberSubtleHaptic(): () -> Unit {
+    val view = LocalView.current
+    return remember(view) {
+        { view.performSubtleHaptic() }
+    }
+}
+
+enum class SettingsCategory(
+    val title: String,
+    val subtitle: String,
+    val icon: ImageVector
+) {
+    APPEARANCE_AND_DISPLAY(
+        title = "Appearance & Display Options",
+        subtitle = "Light, dark, or system theme & keep screen awake",
+        icon = Icons.Default.Palette
+    ),
+    PLAYBACK(
+        title = "Playback Options",
+        subtitle = "Mini player, time display, speed & skip intervals",
+        icon = Icons.Default.GraphicEq
+    ),
+    PODCAST_MANAGEMENT(
+        title = "Podcast Management",
+        subtitle = "Episode badges, auto-archive & downloads",
+        icon = Icons.Default.Podcasts
+    ),
+    LOCAL_AUDIO_FILES(
+        title = "Local Audio Files",
+        subtitle = "Add, rename, delete & set subscriptions title",
+        icon = Icons.Default.AudioFile
+    ),
+    NOTIFICATIONS(
+        title = "Background Activity & Notifications",
+        subtitle = "New episode alerts & streaming cache",
+        icon = Icons.Default.NotificationsActive
+    ),
+    BACKUP(
+        title = "Backup",
+        subtitle = "OPML import/export & gPodder synchronization",
+        icon = Icons.Default.Backup
+    ),
+    ABOUT(
+        title = "About ExpressoPod",
+        subtitle = "App version & information",
+        icon = Icons.Default.Info
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
+fun PodcastAppScreen(vm: PodcastViewModel = viewModel(), themeConfig: Int = vm.currentThemeConfig) {
     val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
+    val currentColorScheme = MaterialTheme.colorScheme
     val keepScreenOn by vm.keepScreenOn.collectAsState()
     DisposableEffect(keepScreenOn) {
         val window = (context as? Activity)?.window
@@ -2244,7 +3863,7 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
     val saveableStateHolder = rememberSaveableStateHolder()
 
     androidx.activity.compose.BackHandler(
-        enabled = activeTab != 0 || vm.subscriptionSelectedPodcast != null || vm.discoverSelectedPodcast != null
+        enabled = activeTab != 0 || vm.subscriptionSelectedPodcast != null || vm.discoverSelectedPodcast != null || vm.settingsSelectedCategory != null
     ) {
         when {
             activeTab == 0 && vm.subscriptionSelectedPodcast != null -> {
@@ -2252,6 +3871,9 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
             }
             activeTab == 1 && vm.discoverSelectedPodcast != null -> {
                 vm.discoverSelectedPodcast = null
+            }
+            activeTab == 3 && vm.settingsSelectedCategory != null -> {
+                vm.settingsSelectedCategory = null
             }
             else -> {
                 activeTab = 0
@@ -2289,11 +3911,31 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
 
     val rewindPreset by vm.rewindSec.collectAsState()
     val forwardPreset by vm.forwardSec.collectAsState()
+    val showMiniPlayer by vm.showMiniPlayer.collectAsState()
+    val isGridView by vm.isGridView.collectAsState()
 
     Scaffold(
+        containerColor = currentColorScheme.background,
+        contentColor = currentColorScheme.onBackground,
         topBar = {
             TopAppBar(
+                modifier = Modifier.background(currentColorScheme.surface),
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = Color.Transparent,
+                    scrolledContainerColor = Color.Transparent,
+                    navigationIconContentColor = currentColorScheme.onSurface,
+                    titleContentColor = currentColorScheme.onSurface,
+                    actionIconContentColor = currentColorScheme.onSurface
+                ),
                 title = {
+                    val headerTitle = when (activeTab) {
+                        0 -> "Subscriptions"
+                        1 -> "Discover"
+                        2 -> "Now Playing"
+                        3 -> "Settings"
+                        4 -> "Up Next"
+                        else -> "Subscriptions"
+                    }
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
@@ -2310,53 +3952,88 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                             )
                         }
                         Text(
-                            "ExpressoPod",
+                            headerTitle,
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Black
                         )
                     }
                 },
                 actions = {
-                    IconButton(onClick = { activeTab = 4 }) {
-                        BadgedBox(
-                            badge = {
-                                if (vm.upNextQueue.isNotEmpty()) {
-                                    Badge(
-                                        containerColor = MaterialTheme.colorScheme.primary,
-                                        contentColor = MaterialTheme.colorScheme.onPrimary,
-                                        modifier = Modifier.border(
-                                            width = 1.5.dp,
-                                            color = MaterialTheme.colorScheme.surface,
-                                            shape = CircleShape
-                                        )
-                                    ) {
-                                        AnimatedContent(
-                                            targetState = vm.upNextQueue.size,
-                                            transitionSpec = {
-                                                (slideInVertically { height -> height } + fadeIn())
-                                                    .togetherWith(slideOutVertically { height -> -height } + fadeOut())
-                                            },
-                                            label = "QueueBadgeCount"
-                                        ) { count ->
-                                            Text(
-                                                text = if (count > 99) "99+" else "$count",
-                                                style = MaterialTheme.typography.labelSmall.copy(
-                                                    fontWeight = FontWeight.ExtraBold,
-                                                    fontSize = 10.sp,
-                                                    lineHeight = 12.sp
-                                                ),
-                                                modifier = Modifier.padding(horizontal = 2.dp)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.padding(end = 10.dp)
+                    ) {
+                        if (activeTab == 0 && vm.subscriptionSelectedPodcast == null) {
+                            IconButton(
+                                onClick = {
+                                    subtleHaptic()
+                                    vm.updateGridView(!isGridView)
+                                },
+                                modifier = Modifier.size(44.dp)
+                            ) {
+                                Icon(
+                                    if (isGridView) Icons.Default.Menu else Icons.Default.GridView,
+                                    contentDescription = "Toggle View",
+                                    tint = MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                        val upNextTotalCount = vm.upNextQueue.size + if (vm.currentEpisode != null && vm.currentPodcast != null) 1 else 0
+                        Box(
+                            modifier = Modifier
+                                .size(44.dp)
+                                .clickable(
+                                    onClick = {
+                                        subtleHaptic()
+                                        activeTab = 4
+                                    },
+                                    role = androidx.compose.ui.semantics.Role.Button,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = ripple(bounded = false, radius = 22.dp)
+                                ),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            BadgedBox(
+                                badge = {
+                                    if (upNextTotalCount > 0) {
+                                        Badge(
+                                            containerColor = MaterialTheme.colorScheme.primary,
+                                            contentColor = MaterialTheme.colorScheme.onPrimary,
+                                            modifier = Modifier.border(
+                                                width = 1.5.dp,
+                                                color = MaterialTheme.colorScheme.surface,
+                                                shape = CircleShape
                                             )
+                                        ) {
+                                            AnimatedContent(
+                                                targetState = upNextTotalCount,
+                                                transitionSpec = {
+                                                    (slideInVertically { height -> height } + fadeIn())
+                                                        .togetherWith(slideOutVertically { height -> -height } + fadeOut())
+                                                },
+                                                label = "QueueBadgeCount"
+                                            ) { count ->
+                                                Text(
+                                                    text = if (count > 99) "99+" else "$count",
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        fontWeight = FontWeight.ExtraBold,
+                                                        fontSize = 10.sp,
+                                                        lineHeight = 12.sp
+                                                    ),
+                                                    modifier = Modifier.padding(horizontal = 2.dp)
+                                                )
+                                            }
                                         }
                                     }
                                 }
+                            ) {
+                                Icon(
+                                    Icons.Default.Podcasts,
+                                    contentDescription = "Up Next",
+                                    tint = if (activeTab == 4) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                )
                             }
-                        ) {
-                            Icon(
-                                Icons.Default.Podcasts,
-                                contentDescription = "Up Next",
-                                tint = if (activeTab == 4) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                            )
                         }
                     }
                 }
@@ -2415,12 +4092,12 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
             ) {
                 val currentEpisode = vm.currentEpisode
                 val currentPodcast = vm.currentPodcast
-                val isMiniPlayerVisible = activeTab != 2 && currentEpisode != null && currentPodcast != null
+                val isMiniPlayerVisible = showMiniPlayer && currentEpisode != null && currentPodcast != null && (activeTab != 2 || vm.nowPlayingTabIndex != 0)
 
                 AnimatedVisibility(
                     visible = isMiniPlayerVisible,
-                    enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-                    exit = slideOutVertically(targetOffsetY = { it }) + fadeOut()
+                    enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
+                    exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut()
                 ) {
                     if (currentEpisode != null && currentPodcast != null) {
                         MiniPlayer(
@@ -2430,8 +4107,12 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                             currentPos = vm.currentPosition,
                             duration = vm.duration,
                             onTogglePlayPause = { vm.togglePlayPause() },
+                            onSkipBackward = { vm.skipRewind() },
                             onSkipForward = { vm.skipForward() },
-                            onClick = { activeTab = 2 }
+                            onClick = {
+                                vm.nowPlayingTabIndex = 0
+                                activeTab = 2
+                            }
                         )
                     }
                 }
@@ -2465,13 +4146,25 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
 
                         tabs.forEach { (index, icon, label) ->
                             val selected = activeTab == index
+                            val itemIconColor = if (selected) currentColorScheme.onSecondaryContainer else currentColorScheme.onSurfaceVariant
+                            val itemTextColor = if (selected) currentColorScheme.onSurface else currentColorScheme.onSurfaceVariant
                             NavigationBarItem(
                                 selected = selected,
-                                onClick = { activeTab = index },
+                                onClick = {
+                                    subtleHaptic()
+                                    if (index == 0) {
+                                        vm.subscriptionSelectedPodcast = null
+                                    }
+                                    if (index == 3 && activeTab == 3) {
+                                        vm.settingsSelectedCategory = null
+                                    }
+                                    activeTab = index
+                                },
                                 icon = {
                                     Icon(
                                         icon,
                                         contentDescription = label,
+                                        tint = itemIconColor,
                                         modifier = Modifier.size(iconSize)
                                     )
                                 },
@@ -2481,11 +4174,19 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                                         maxLines = 1,
                                         softWrap = false,
                                         overflow = TextOverflow.Ellipsis,
+                                        color = itemTextColor,
                                         style = tabTextStyle.copy(
                                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
                                         )
                                     )
                                 },
+                                colors = NavigationBarItemDefaults.colors(
+                                    selectedIconColor = currentColorScheme.onSecondaryContainer,
+                                    selectedTextColor = currentColorScheme.onSurface,
+                                    indicatorColor = currentColorScheme.secondaryContainer,
+                                    unselectedIconColor = currentColorScheme.onSurfaceVariant,
+                                    unselectedTextColor = currentColorScheme.onSurfaceVariant
+                                ),
                                 alwaysShowLabel = true
                             )
                         }
@@ -2503,6 +4204,10 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                             onEpisodeSelected = { podcast, episode ->
                                 vm.playEpisode(podcast, episode, autoPlay = false)
                                 activeTab = 2
+                            },
+                            onOpenLocalAudioSettings = {
+                                vm.settingsSelectedCategory = SettingsCategory.LOCAL_AUDIO_FILES
+                                activeTab = 3
                             }
                         )
                     }
@@ -2524,12 +4229,16 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                         )
                     }
                     3 -> {
-                        SettingsScreen(vm = vm)
+                        SettingsScreen(vm = vm, themeConfig = themeConfig)
                     }
                     4 -> {
                         UpNextScreen(
                             vm = vm,
-                            onClose = { activeTab = 0 }
+                            onClose = { activeTab = 0 },
+                            onOpenNowPlaying = {
+                                vm.nowPlayingTabIndex = 0
+                                activeTab = 2
+                            }
                         )
                     }
                 }
@@ -2544,6 +4253,10 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel()) {
                 onSave = { r, f -> vm.updatePresets(r, f) }
             )
         }
+
+        if (vm.showCustomFeedDialog) {
+            CustomRssFeedDialog(vm = vm)
+        }
     }
 }
 
@@ -2555,10 +4268,12 @@ fun MiniPlayer(
     currentPos: Long,
     duration: Long,
     onTogglePlayPause: () -> Unit,
+    onSkipBackward: () -> Unit,
     onSkipForward: () -> Unit,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     val progress = if (duration > 0L) (currentPos.toFloat() / duration.toFloat()).coerceIn(0f, 1f) else 0f
 
     Surface(
@@ -2571,7 +4286,10 @@ fun MiniPlayer(
             .widthIn(max = 560.dp)
             .padding(horizontal = 12.dp, vertical = 4.dp)
             .clip(RoundedCornerShape(20.dp))
-            .clickable { onClick() }
+            .clickable {
+                subtleHaptic()
+                onClick()
+            }
     ) {
         Column {
             if (duration > 0L) {
@@ -2624,22 +4342,28 @@ fun MiniPlayer(
                     )
                 }
 
-                Spacer(modifier = Modifier.width(6.dp))
+                Spacer(modifier = Modifier.width(4.dp))
 
                 IconButton(
-                    onClick = onSkipForward,
-                    modifier = Modifier.size(38.dp)
+                    onClick = {
+                        subtleHaptic()
+                        onSkipBackward()
+                    },
+                    modifier = Modifier.size(36.dp)
                 ) {
                     Icon(
-                        Icons.Default.FastForward,
-                        contentDescription = "Fast Forward",
+                        Icons.Default.FastRewind,
+                        contentDescription = "Skip Backward",
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(20.dp)
                     )
                 }
 
                 FilledTonalIconButton(
-                    onClick = onTogglePlayPause,
+                    onClick = {
+                        subtleHaptic()
+                        onTogglePlayPause()
+                    },
                     modifier = Modifier.size(42.dp),
                     colors = IconButtonDefaults.filledTonalIconButtonColors(
                         containerColor = MaterialTheme.colorScheme.primaryContainer,
@@ -2652,33 +4376,65 @@ fun MiniPlayer(
                         modifier = Modifier.size(24.dp)
                     )
                 }
+
+                IconButton(
+                    onClick = {
+                        subtleHaptic()
+                        onSkipForward()
+                    },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        Icons.Default.FastForward,
+                        contentDescription = "Skip Forward",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
-fun SettingsScreen(vm: PodcastViewModel) {
-    var showAboutScreen by rememberSaveable { mutableStateOf(false) }
-
-    if (showAboutScreen) {
-        AboutScreen(onBack = { showAboutScreen = false })
-        return
-    }
-
+fun SettingsScreen(vm: PodcastViewModel, themeConfig: Int = vm.currentThemeConfig) {
     val context = LocalContext.current
-    val themeConfig by vm.themeConfig.collectAsState()
+    val subtleHaptic = rememberSubtleHaptic()
     val rewindPreset by vm.rewindSec.collectAsState()
     val forwardPreset by vm.forwardSec.collectAsState()
     val notificationsEnabled by vm.notificationsEnabled.collectAsState()
     val autoArchiveEnabled by vm.autoArchiveEnabled.collectAsState()
     val keepScreenOn by vm.keepScreenOn.collectAsState()
+    val showMiniPlayer by vm.showMiniPlayer.collectAsState()
     val showRemainingTime by vm.showRemainingTime.collectAsState()
     val cachePlayingEpisode by vm.cachePlayingEpisode.collectAsState()
+    val showUnplayedBadge by vm.showUnplayedBadge.collectAsState()
+    val showDownloadedBadge by vm.showDownloadedBadge.collectAsState()
     val downloadedEpisodes by vm.downloadedEpisodes.collectAsState()
     val subscriptions by vm.subscriptions.collectAsState()
     val mutedPodcastUrls by vm.mutedNotificationPodcasts.collectAsState()
     val podcastsToNotifyExpanded by vm.podcastsToNotifyExpanded.collectAsState()
+    val localAudioFiles by vm.localAudioFiles.collectAsState()
+    val localSubscriptionTitle by vm.localSubscriptionTitle.collectAsState()
+    val isImportingLocalAudio by vm.isImportingLocalAudio.collectAsState()
+
+    val launcherAddLocalAudio = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) {
+            vm.importLocalAudioFiles(uris) { addedCount ->
+                if (addedCount > 0) {
+                    Toast.makeText(
+                        context,
+                        "Added $addedCount audio ${if (addedCount == 1) "file" else "files"} to \"${vm.localSubscriptionTitle.value}\"",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                } else {
+                    Toast.makeText(context, "Could not import selected file(s)", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -2704,172 +4460,309 @@ fun SettingsScreen(vm: PodcastViewModel) {
         uri?.let { vm.importOpml(it) }
     }
 
-    val scrollState = rememberScrollState()
+    val selectedCategory = vm.settingsSelectedCategory
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 48.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        Text(
-            text = "Settings",
-            style = MaterialTheme.typography.headlineMedium,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(vertical = 4.dp)
-        )
-
-        // 1. Appearance
-        SettingsCategoryHeader(
-            title = "Appearance",
-            icon = Icons.Default.Palette
-        )
-        ThemeSettingsCard(
-            currentTheme = themeConfig,
-            onSelectTheme = { vm.updateTheme(it) }
-        )
-
-        // 2. Display Options
-        SettingsCategoryHeader(
-            title = "Display Options",
-            icon = Icons.Default.StayCurrentPortrait
-        )
-        KeepScreenOnCard(
-            keepScreenOn = keepScreenOn,
-            onToggleKeepScreenOn = { vm.setKeepScreenOn(it) }
-        )
-
-        // 3. Playback Options
-        SettingsCategoryHeader(
-            title = "Playback Options",
-            icon = Icons.Default.GraphicEq
-        )
-        ShowRemainingTimeCard(
-            showRemainingTime = showRemainingTime,
-            onToggleShowRemainingTime = { vm.setShowRemainingTime(it) }
-        )
-        SkipPresetsCard(
-            rewindPreset = rewindPreset,
-            forwardPreset = forwardPreset,
-            onUpdateRewind = { vm.updatePresets(it, forwardPreset) },
-            onUpdateForward = { vm.updatePresets(rewindPreset, it) }
-        )
-
-        // 4. Podcast Management
-        SettingsCategoryHeader(
-            title = "Podcast Management",
-            icon = Icons.Default.Podcasts
-        )
-        StreamingCacheCard(
-            cachePlayingEpisode = cachePlayingEpisode,
-            onToggleCachePlayingEpisode = { vm.setCachePlayingEpisode(it) }
-        )
-        AutoArchiveCard(
-            autoArchiveEnabled = autoArchiveEnabled,
-            onToggle = { vm.setAutoArchiveEnabled(it) }
-        )
-        DownloadsSettingsCard(
-            downloadCount = downloadedEpisodes.size,
-            onRemoveAllDownloads = {
-                vm.deleteAllDownloads()
+    AnimatedContent(
+        targetState = selectedCategory,
+        transitionSpec = {
+            if (targetState != null) {
+                (slideInHorizontally { width -> width / 3 } + fadeIn())
+                    .togetherWith(slideOutHorizontally { width -> -width / 4 } + fadeOut())
+            } else {
+                (slideInHorizontally { width -> -width / 4 } + fadeIn())
+                    .togetherWith(slideOutHorizontally { width -> width / 3 } + fadeOut())
             }
-        )
-
-        // 5. Background Activity & Notifications
-        SettingsCategoryHeader(
-            title = "Background Activity & Notifications",
-            icon = Icons.Default.NotificationsActive
-        )
-        NotificationSettingsCard(
-            notificationsEnabled = notificationsEnabled,
-            onToggleNotifications = { checked ->
-                if (checked) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
-                            vm.setNotificationsEnabled(true)
-                            Toast.makeText(context, "New episode notifications enabled!", Toast.LENGTH_SHORT).show()
-                        } else {
-                            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                        }
-                    } else {
-                        vm.setNotificationsEnabled(true)
-                        Toast.makeText(context, "New episode notifications enabled!", Toast.LENGTH_SHORT).show()
+        },
+        label = "SettingsCategoryTransition"
+    ) { category ->
+        when (category) {
+            null -> {
+                val listScrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(listScrollState)
+                        .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 48.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SettingsCategory.entries.forEach { cat ->
+                        SettingsCategoryItemCard(
+                            category = cat,
+                            onClick = {
+                                subtleHaptic()
+                                vm.settingsSelectedCategory = cat
+                            }
+                        )
                     }
-                } else {
-                    vm.setNotificationsEnabled(false)
-                    Toast.makeText(context, "Notifications turned off", Toast.LENGTH_SHORT).show()
                 }
-            },
-            onSyncNow = {
-                vm.triggerEpisodeSync()
-                Toast.makeText(context, "Checking subscriptions for new episodes...", Toast.LENGTH_SHORT).show()
-            },
-            subscriptions = subscriptions,
-            mutedPodcastUrls = mutedPodcastUrls,
-            onTogglePodcastNotification = { url, enabled -> vm.togglePodcastNotification(url, enabled) },
-            onSetAllPodcastNotifications = { enabled -> vm.setAllPodcastNotifications(enabled) },
-            isListExpanded = podcastsToNotifyExpanded,
-            onToggleListExpanded = { vm.setPodcastsToNotifyExpanded(it) }
-        )
-        StreamingCacheCard(
-            cachePlayingEpisode = cachePlayingEpisode,
-            onToggleCachePlayingEpisode = { vm.setCachePlayingEpisode(it) }
-        )
+            }
 
-        // 6. Backup
-        SettingsCategoryHeader(
-            title = "Backup",
-            icon = Icons.Default.Backup
-        )
-        OpmlSubscriptionsCard(
-            onImport = { launcherImport.launch(arrayOf("text/xml", "application/xml", "*/*")) },
-            onExport = { launcherExport.launch("subscriptions.opml") }
-        )
+            SettingsCategory.ABOUT -> {
+                AboutScreen(onBack = { vm.settingsSelectedCategory = null })
+            }
 
-        Spacer(Modifier.height(8.dp))
+            else -> {
+                androidx.activity.compose.BackHandler {
+                    vm.settingsSelectedCategory = null
+                }
 
-        AboutExpressoPodCard(
-            onClick = { showAboutScreen = true }
-        )
+                val detailScrollState = rememberScrollState()
+                Column(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        FilledTonalIconButton(
+                            onClick = {
+                                subtleHaptic()
+                                vm.settingsSelectedCategory = null
+                            }
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to Settings")
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = category.icon,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            text = category.title,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .verticalScroll(detailScrollState)
+                            .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 48.dp),
+                        verticalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        when (category) {
+                            SettingsCategory.APPEARANCE_AND_DISPLAY -> {
+                                ThemeSettingsCard(
+                                    currentTheme = themeConfig,
+                                    onSelectTheme = { vm.updateTheme(it) }
+                                )
+                                KeepScreenOnCard(
+                                    keepScreenOn = keepScreenOn,
+                                    onToggleKeepScreenOn = { vm.setKeepScreenOn(it) }
+                                )
+                            }
+
+                            SettingsCategory.PLAYBACK -> {
+                                ShowMiniPlayerCard(
+                                    showMiniPlayer = showMiniPlayer,
+                                    onToggleShowMiniPlayer = { vm.setShowMiniPlayer(it) }
+                                )
+                                ShowRemainingTimeCard(
+                                    showRemainingTime = showRemainingTime,
+                                    onToggleShowRemainingTime = { vm.setShowRemainingTime(it) }
+                                )
+                                GlobalPlaybackSpeedCard(
+                                    globalSpeed = vm.globalPlaybackSpeed,
+                                    onUpdateGlobalSpeed = { vm.updateGlobalPlaybackSpeed(it) }
+                                )
+                                SkipPresetsCard(
+                                    rewindPreset = rewindPreset,
+                                    forwardPreset = forwardPreset,
+                                    onUpdateRewind = { vm.updatePresets(it, forwardPreset) },
+                                    onUpdateForward = { vm.updatePresets(rewindPreset, it) }
+                                )
+                            }
+
+                            SettingsCategory.PODCAST_MANAGEMENT -> {
+                                EpisodeBadgesSettingsCard(
+                                    showUnplayedBadge = showUnplayedBadge,
+                                    onToggleUnplayedBadge = { vm.setShowUnplayedBadge(it) },
+                                    showDownloadedBadge = showDownloadedBadge,
+                                    onToggleDownloadedBadge = { vm.setShowDownloadedBadge(it) }
+                                )
+                                AutoArchiveCard(
+                                    autoArchiveEnabled = autoArchiveEnabled,
+                                    onToggle = { vm.setAutoArchiveEnabled(it) }
+                                )
+                                DownloadsSettingsCard(
+                                    downloadCount = downloadedEpisodes.size,
+                                    onRemoveAllDownloads = {
+                                        vm.deleteAllDownloads()
+                                    }
+                                )
+                            }
+
+                            SettingsCategory.LOCAL_AUDIO_FILES -> {
+                                LocalAudioFilesSettingsSection(
+                                    localFiles = localAudioFiles,
+                                    subscriptionTitle = localSubscriptionTitle,
+                                    isImporting = isImportingLocalAudio,
+                                    currentPlayingUrl = vm.currentEpisode?.audioUrl,
+                                    isPlaying = vm.isPlaying,
+                                    onUpdateSubscriptionTitle = { newTitle ->
+                                        vm.updateLocalSubscriptionTitle(newTitle)
+                                    },
+                                    onAddAudioFiles = {
+                                        launcherAddLocalAudio.launch(arrayOf("audio/*"))
+                                    },
+                                    onRenameAudioFile = { fileId, newTitle ->
+                                        vm.renameLocalAudioFile(fileId, newTitle)
+                                    },
+                                    onDeleteAudioFile = { fileId ->
+                                        vm.deleteLocalAudioFile(fileId)
+                                    },
+                                    onDeleteAllAudioFiles = {
+                                        vm.deleteAllLocalAudioFiles()
+                                    },
+                                    onPlayAudioFile = { file ->
+                                        if (vm.currentEpisode?.audioUrl == file.audioUrl) {
+                                            vm.togglePlayPause()
+                                        } else {
+                                            vm.playLocalAudioFile(file, autoPlay = true)
+                                        }
+                                    },
+                                    onOpenInSubscriptions = {
+                                        vm.openLocalAudioInSubscriptions()
+                                    }
+                                )
+                            }
+
+                            SettingsCategory.NOTIFICATIONS -> {
+                                NotificationSettingsCard(
+                                    notificationsEnabled = notificationsEnabled,
+                                    onToggleNotifications = { checked ->
+                                        if (checked) {
+                                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                                if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
+                                                    vm.setNotificationsEnabled(true)
+                                                    Toast.makeText(context, "New episode notifications enabled!", Toast.LENGTH_SHORT).show()
+                                                } else {
+                                                    permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                                                }
+                                            } else {
+                                                vm.setNotificationsEnabled(true)
+                                                Toast.makeText(context, "New episode notifications enabled!", Toast.LENGTH_SHORT).show()
+                                            }
+                                        } else {
+                                            vm.setNotificationsEnabled(false)
+                                            Toast.makeText(context, "Notifications turned off", Toast.LENGTH_SHORT).show()
+                                        }
+                                    },
+                                    onSyncNow = {
+                                        vm.triggerEpisodeSync()
+                                        Toast.makeText(context, "Checking subscriptions for new episodes...", Toast.LENGTH_SHORT).show()
+                                    },
+                                    subscriptions = subscriptions.filterNot { LocalAudioManager.isLocalPodcast(it) },
+                                    mutedPodcastUrls = mutedPodcastUrls,
+                                    onTogglePodcastNotification = { url, enabled -> vm.togglePodcastNotification(url, enabled) },
+                                    onSetAllPodcastNotifications = { enabled -> vm.setAllPodcastNotifications(enabled) },
+                                    isListExpanded = podcastsToNotifyExpanded,
+                                    onToggleListExpanded = { vm.setPodcastsToNotifyExpanded(it) }
+                                )
+                                StreamingCacheCard(
+                                    cachePlayingEpisode = cachePlayingEpisode,
+                                    onToggleCachePlayingEpisode = { vm.setCachePlayingEpisode(it) }
+                                )
+                            }
+
+                            SettingsCategory.BACKUP -> {
+                                OpmlSubscriptionsCard(
+                                    onImport = { launcherImport.launch(arrayOf("text/xml", "application/xml", "*/*")) },
+                                    onExport = { launcherExport.launch("subscriptions.opml") }
+                                )
+                                GPodderSyncCard(vm = vm)
+                            }
+
+                            SettingsCategory.ABOUT -> {}
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 @Composable
-private fun SettingsCategoryHeader(
-    title: String,
-    icon: ImageVector? = null,
+private fun SettingsCategoryItemCard(
+    category: SettingsCategory,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(top = 10.dp, bottom = 2.dp, start = 4.dp, end = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
+    val configuration = LocalConfiguration.current
+    val screenWidthDp = configuration.screenWidthDp
+    val cardPadding = if (screenWidthDp < 360) 14.dp else 18.dp
+
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = modifier.fillMaxWidth()
     ) {
-        if (icon != null) {
-            Box(
-                modifier = Modifier
-                    .size(28.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)),
-                contentAlignment = Alignment.Center
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(cardPadding),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = icon,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(16.dp)
-                )
+                Box(
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = category.icon,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(modifier = Modifier.width(14.dp))
+                Column {
+                    Text(
+                        text = category.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = category.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
             Spacer(modifier = Modifier.width(10.dp))
+            Icon(
+                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = "Open ${category.title}",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.primary
-        )
     }
 }
 
@@ -2904,6 +4797,7 @@ private fun SettingOptionChip(
     showCheckIcon: Boolean = true,
     onClick: () -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     val configuration = LocalConfiguration.current
     val density = LocalDensity.current
     val screenWidthDp = configuration.screenWidthDp
@@ -2941,7 +4835,10 @@ private fun SettingOptionChip(
         modifier = modifier
             .clip(RoundedCornerShape(12.dp))
             .background(bgColor)
-            .clickable(onClick = onClick)
+            .clickable {
+                subtleHaptic()
+                onClick()
+            }
             .padding(vertical = vertPadding, horizontal = horizPadding),
         contentAlignment = Alignment.Center
     ) {
@@ -3034,9 +4931,16 @@ private fun KeepScreenOnCard(
     keepScreenOn: Boolean,
     onToggleKeepScreenOn: (Boolean) -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     SettingCard {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleKeepScreenOn(!keepScreenOn)
+                },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3067,7 +4971,64 @@ private fun KeepScreenOnCard(
             Spacer(Modifier.width(8.dp))
             Switch(
                 checked = keepScreenOn,
-                onCheckedChange = onToggleKeepScreenOn
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleKeepScreenOn(it)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun ShowMiniPlayerCard(
+    showMiniPlayer: Boolean,
+    onToggleShowMiniPlayer: (Boolean) -> Unit
+) {
+    val subtleHaptic = rememberSubtleHaptic()
+    SettingCard {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleShowMiniPlayer(!showMiniPlayer)
+                },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.PictureInPictureAlt,
+                    contentDescription = null,
+                    tint = if (showMiniPlayer) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        text = "Show Mini Player",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Display mini player at the bottom when away from Now Playing",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = showMiniPlayer,
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleShowMiniPlayer(it)
+                }
             )
         }
     }
@@ -3078,9 +5039,16 @@ private fun ShowRemainingTimeCard(
     showRemainingTime: Boolean,
     onToggleShowRemainingTime: (Boolean) -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     SettingCard {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleShowRemainingTime(!showRemainingTime)
+                },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3111,7 +5079,10 @@ private fun ShowRemainingTimeCard(
             Spacer(Modifier.width(8.dp))
             Switch(
                 checked = showRemainingTime,
-                onCheckedChange = onToggleShowRemainingTime
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleShowRemainingTime(it)
+                }
             )
         }
     }
@@ -3122,9 +5093,16 @@ private fun StreamingCacheCard(
     cachePlayingEpisode: Boolean,
     onToggleCachePlayingEpisode: (Boolean) -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     SettingCard {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleCachePlayingEpisode(!cachePlayingEpisode)
+                },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3155,7 +5133,128 @@ private fun StreamingCacheCard(
             Spacer(Modifier.width(8.dp))
             Switch(
                 checked = cachePlayingEpisode,
-                onCheckedChange = onToggleCachePlayingEpisode
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleCachePlayingEpisode(it)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun GlobalPlaybackSpeedCard(
+    globalSpeed: Float,
+    onUpdateGlobalSpeed: (Float) -> Unit
+) {
+    val subtleHaptic = rememberSubtleHaptic()
+    val isCustomGlobalSpeed = kotlin.math.abs(globalSpeed - 1.0f) >= 0.05f
+    var lastHapticStep by remember { mutableIntStateOf((globalSpeed * 20f).toInt()) }
+
+    SettingCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Speed,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        text = "Global Playback Speed",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Default speed for all subscriptions without a custom speed",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer
+                ) {
+                    Text(
+                        text = PlaybackSpeedManager.formatSpeed(globalSpeed),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+                if (isCustomGlobalSpeed) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        modifier = Modifier.clickable {
+                            subtleHaptic()
+                            onUpdateGlobalSpeed(1.0f)
+                        }
+                    ) {
+                        Text(
+                            text = "1.0x",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        Slider(
+            value = globalSpeed,
+            onValueChange = { raw ->
+                val step = kotlin.math.round(raw * 20f).toInt()
+                if (step != lastHapticStep) {
+                    lastHapticStep = step
+                    subtleHaptic()
+                }
+                onUpdateGlobalSpeed(raw)
+            },
+            valueRange = PlaybackSpeedManager.MIN_SPEED..PlaybackSpeedManager.MAX_SPEED,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(32.dp)
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "0.5x",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "1.0x",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "5.0x",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }
@@ -3259,12 +5358,19 @@ private fun NotificationSettingsCard(
     isListExpanded: Boolean,
     onToggleListExpanded: (Boolean) -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     val activeCount = subscriptions.count { !mutedPodcastUrls.contains(it.feedUrl) }
     val totalCount = subscriptions.size
 
     SettingCard {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleNotifications(!notificationsEnabled)
+                },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3295,7 +5401,10 @@ private fun NotificationSettingsCard(
             Spacer(Modifier.width(8.dp))
             Switch(
                 checked = notificationsEnabled,
-                onCheckedChange = onToggleNotifications
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleNotifications(it)
+                }
             )
         }
 
@@ -3332,7 +5441,10 @@ private fun NotificationSettingsCard(
                     )
                     Spacer(Modifier.height(10.dp))
                     FilledTonalButton(
-                        onClick = onSyncNow,
+                        onClick = {
+                            subtleHaptic()
+                            onSyncNow()
+                        },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -3351,14 +5463,17 @@ private fun NotificationSettingsCard(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(12.dp))
-                    .clickable { onToggleListExpanded(!isListExpanded) }
+                    .clickable {
+                        subtleHaptic()
+                        onToggleListExpanded(!isListExpanded)
+                    }
                     .padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Podcasts to Notify",
+                        text = "Episode Notifications",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -3368,7 +5483,10 @@ private fun NotificationSettingsCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                IconButton(onClick = { onToggleListExpanded(!isListExpanded) }) {
+                IconButton(onClick = {
+                    subtleHaptic()
+                    onToggleListExpanded(!isListExpanded)
+                }) {
                     Icon(
                         if (isListExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                         contentDescription = if (isListExpanded) "Collapse" else "Expand"
@@ -3401,14 +5519,20 @@ private fun NotificationSettingsCard(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         FilledTonalButton(
-                            onClick = { onSetAllPodcastNotifications(true) },
+                            onClick = {
+                                subtleHaptic()
+                                onSetAllPodcastNotifications(true)
+                            },
                             modifier = Modifier.weight(1f),
                             enabled = activeCount < totalCount
                         ) {
                             Text("Select All", style = MaterialTheme.typography.labelMedium)
                         }
                         OutlinedButton(
-                            onClick = { onSetAllPodcastNotifications(false) },
+                            onClick = {
+                                subtleHaptic()
+                                onSetAllPodcastNotifications(false)
+                            },
                             modifier = Modifier.weight(1f),
                             enabled = activeCount > 0
                         ) {
@@ -3432,7 +5556,10 @@ private fun NotificationSettingsCard(
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clickable { onTogglePodcastNotification(podcast.feedUrl, !isNotified) }
+                                        .clickable {
+                                            subtleHaptic()
+                                            onTogglePodcastNotification(podcast.feedUrl, !isNotified)
+                                        }
                                         .padding(horizontal = 12.dp, vertical = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
@@ -3464,6 +5591,7 @@ private fun NotificationSettingsCard(
                                     Switch(
                                         checked = isNotified,
                                         onCheckedChange = { checked ->
+                                            subtleHaptic()
                                             onTogglePodcastNotification(podcast.feedUrl, checked)
                                         }
                                     )
@@ -3478,10 +5606,155 @@ private fun NotificationSettingsCard(
 }
 
 @Composable
+private fun EpisodeBadgesSettingsCard(
+    showUnplayedBadge: Boolean,
+    onToggleUnplayedBadge: (Boolean) -> Unit,
+    showDownloadedBadge: Boolean,
+    onToggleDownloadedBadge: (Boolean) -> Unit
+) {
+    val subtleHaptic = rememberSubtleHaptic()
+    SettingCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Podcasts,
+                contentDescription = null,
+                tint = if (showUnplayedBadge || showDownloadedBadge) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text(
+                    text = "Subscription Episode Badges",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "Display episode count badges on subscribed podcasts",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f))
+        Spacer(Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleUnplayedBadge(!showUnplayedBadge)
+                },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = if (showUnplayedBadge) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    contentColor = if (showUnplayedBadge) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Default.Podcasts,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        text = "Unplayed Episodes Badge",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Show count of unplayed & unarchived episodes",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = showUnplayedBadge,
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleUnplayedBadge(it)
+                }
+            )
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggleDownloadedBadge(!showDownloadedBadge)
+                },
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = if (showDownloadedBadge) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.surfaceContainerHighest,
+                    contentColor = if (showDownloadedBadge) MaterialTheme.colorScheme.onTertiary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Default.DownloadDone,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        text = "Downloaded Episodes Badge",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "Show count of downloaded unplayed episodes",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = showDownloadedBadge,
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggleDownloadedBadge(it)
+                }
+            )
+        }
+    }
+}
+
+@Composable
 private fun OpmlSubscriptionsCard(
     onImport: () -> Unit,
     onExport: () -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     SettingCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
@@ -3510,7 +5783,10 @@ private fun OpmlSubscriptionsCard(
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             FilledTonalButton(
-                onClick = onImport,
+                onClick = {
+                    subtleHaptic()
+                    onImport()
+                },
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -3518,7 +5794,10 @@ private fun OpmlSubscriptionsCard(
                 Text("Import OPML")
             }
             FilledTonalButton(
-                onClick = onExport,
+                onClick = {
+                    subtleHaptic()
+                    onExport()
+                },
                 modifier = Modifier.weight(1f)
             ) {
                 Icon(Icons.Default.Upload, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -3530,13 +5809,667 @@ private fun OpmlSubscriptionsCard(
 }
 
 @Composable
+private fun GPodderSyncCard(
+    vm: PodcastViewModel
+) {
+    val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
+    val syncState by vm.gpodderSyncState.collectAsState()
+    val coroutineScope = rememberCoroutineScope()
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    var serverTypeSelection by remember(syncState.config.serverType) {
+        mutableStateOf(syncState.config.serverType)
+    }
+    var serverUrlInput by remember(syncState.config.serverUrl) {
+        mutableStateOf(syncState.config.serverUrl)
+    }
+    var usernameInput by remember(syncState.config.username) {
+        mutableStateOf(syncState.config.username)
+    }
+    var passwordInput by remember(syncState.config.password) {
+        mutableStateOf(syncState.config.password)
+    }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var showDisconnectDialog by remember { mutableStateOf(false) }
+
+    val isConfigured = syncState.config.isConfigured
+    val selectedInterval = GPodderSyncInterval.fromMinutes(syncState.config.syncIntervalMinutes)
+
+    if (showDisconnectDialog) {
+        AlertDialog(
+            onDismissRequest = { showDisconnectDialog = false },
+            icon = { Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("Disconnect gPodder?") },
+            text = {
+                Text("This will remove your sync credentials from this device and stop automatic synchronization. Your local podcasts and episode history will remain on your device.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        subtleHaptic()
+                        showDisconnectDialog = false
+                        vm.disconnectGPodder()
+                        serverTypeSelection = GPodderServerType.STANDARD
+                        serverUrlInput = ""
+                        usernameInput = ""
+                        passwordInput = ""
+                        Toast.makeText(context, "gPodder disconnected", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Disconnect")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDisconnectDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    SettingCard {
+        // Top Header Row with Title and Sync Toggle Switch
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    Icons.Default.Sync,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        text = "gPodder Sync",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "Sync subscriptions, playback times & status",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(
+                checked = syncState.config.enabled,
+                onCheckedChange = { enable ->
+                    subtleHaptic()
+                    if (enable) {
+                        if (serverUrlInput.isBlank() || usernameInput.isBlank() || passwordInput.isBlank()) {
+                            Toast.makeText(context, "Please enter server URL, username, and password first", Toast.LENGTH_LONG).show()
+                        } else {
+                            vm.saveGPodderConfig(
+                                enabled = true,
+                                serverType = serverTypeSelection,
+                                serverUrl = serverUrlInput.trim(),
+                                username = usernameInput.trim(),
+                                password = passwordInput,
+                                intervalMinutes = selectedInterval.minutes
+                            )
+                            vm.setGPodderSyncEnabled(true)
+                            Toast.makeText(context, "gPodder sync enabled", Toast.LENGTH_SHORT).show()
+                        }
+                    } else {
+                        vm.setGPodderSyncEnabled(false)
+                        Toast.makeText(context, "gPodder sync disabled", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Connect to gpodder.net, a custom self-hosted server, or Nextcloud with the gPodder Sync app installed. Synchronizes podcast subscriptions, played/unplayed status, and exact playback positions.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        // Server Service Type Selector (Standard gPodder vs Nextcloud)
+        Text(
+            text = "Sync Service",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.Bold
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            GPodderServerType.entries.forEach { sType ->
+                val isSelected = sType == serverTypeSelection
+                FilterChip(
+                    selected = isSelected,
+                    onClick = {
+                        subtleHaptic()
+                        serverTypeSelection = sType
+                        vm.clearGPodderTestResult()
+                        if (serverUrlInput.isBlank() || serverUrlInput == "https://gpodder.net" || serverUrlInput == "https://cloud.example.com") {
+                            serverUrlInput = sType.defaultPlaceholder
+                        }
+                    },
+                    label = {
+                        Text(sType.label)
+                    },
+                    leadingIcon = if (isSelected) {
+                        {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    } else null
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = serverTypeSelection.description,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.primary
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        // Server URL Field
+        OutlinedTextField(
+            value = serverUrlInput,
+            onValueChange = {
+                serverUrlInput = it
+                vm.clearGPodderTestResult()
+            },
+            label = {
+                Text(
+                    if (serverTypeSelection == GPodderServerType.NEXTCLOUD) {
+                        "Nextcloud URL (HTTP or HTTPS)"
+                    } else {
+                        "Server URL (HTTP or HTTPS)"
+                    }
+                )
+            },
+            placeholder = { Text(serverTypeSelection.defaultPlaceholder) },
+            supportingText = {
+                Text(
+                    if (serverTypeSelection == GPodderServerType.NEXTCLOUD) {
+                        "e.g. https://cloud.example.com or with /index.php/apps/gpoddersync"
+                    } else {
+                        "e.g. https://gpodder.net or http://your-server:8080"
+                    }
+                )
+            },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            leadingIcon = {
+                Icon(Icons.Default.Language, contentDescription = null, modifier = Modifier.size(20.dp))
+            },
+            trailingIcon = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (serverUrlInput.isNotBlank()) {
+                        IconButton(onClick = {
+                            subtleHaptic()
+                            serverUrlInput = ""
+                            vm.clearGPodderTestResult()
+                        }) {
+                            Icon(Icons.Default.Close, contentDescription = "Clear URL")
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                subtleHaptic()
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+                                val clipText = clipboard?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.trim()
+                                if (!clipText.isNullOrBlank()) {
+                                    serverUrlInput = clipText
+                                    vm.clearGPodderTestResult()
+                                } else {
+                                    Toast.makeText(context, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Default.ContentPaste, contentDescription = "Paste URL")
+                        }
+                    }
+                }
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Next)
+        )
+
+        Spacer(Modifier.height(10.dp))
+
+        // Username Field
+        OutlinedTextField(
+            value = usernameInput,
+            onValueChange = {
+                usernameInput = it
+                vm.clearGPodderTestResult()
+            },
+            label = { Text("Username") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            leadingIcon = {
+                Icon(Icons.Default.Person, contentDescription = null, modifier = Modifier.size(20.dp))
+            },
+            trailingIcon = {
+                if (usernameInput.isNotBlank()) {
+                    IconButton(onClick = {
+                        subtleHaptic()
+                        usernameInput = ""
+                        vm.clearGPodderTestResult()
+                    }) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear username")
+                    }
+                }
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text, imeAction = ImeAction.Next)
+        )
+
+        Spacer(Modifier.height(10.dp))
+
+        // Password Field
+        OutlinedTextField(
+            value = passwordInput,
+            onValueChange = {
+                passwordInput = it
+                vm.clearGPodderTestResult()
+            },
+            label = {
+                Text(
+                    if (serverTypeSelection == GPodderServerType.NEXTCLOUD) {
+                        "Password or App Password"
+                    } else {
+                        "Password"
+                    }
+                )
+            },
+            supportingText = if (serverTypeSelection == GPodderServerType.NEXTCLOUD) {
+                { Text("Nextcloud app passwords (created in Settings > Security) are supported") }
+            } else null,
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+            leadingIcon = {
+                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(20.dp))
+            },
+            trailingIcon = {
+                IconButton(onClick = {
+                    subtleHaptic()
+                    passwordVisible = !passwordVisible
+                }) {
+                    Icon(
+                        if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                    )
+                }
+            },
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(onDone = { keyboardController?.hide() })
+        )
+
+        Spacer(Modifier.height(14.dp))
+
+        // Test Connection & Save Action Buttons
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            FilledTonalButton(
+                onClick = {
+                    subtleHaptic()
+                    keyboardController?.hide()
+                    coroutineScope.launch {
+                        val trimmedUrl = serverUrlInput.trim()
+                        val trimmedUser = usernameInput.trim()
+                        if (trimmedUrl.isBlank() || trimmedUser.isBlank() || passwordInput.isBlank()) {
+                            Toast.makeText(context, "Please fill in all fields", Toast.LENGTH_SHORT).show()
+                            return@launch
+                        }
+
+                        // Save current inputs
+                        vm.saveGPodderConfig(
+                            enabled = syncState.config.enabled,
+                            serverType = serverTypeSelection,
+                            serverUrl = trimmedUrl,
+                            username = trimmedUser,
+                            password = passwordInput,
+                            intervalMinutes = selectedInterval.minutes
+                        )
+
+                        val result = vm.testGPodderConnection(
+                            serverType = serverTypeSelection,
+                            serverUrl = trimmedUrl,
+                            username = trimmedUser,
+                            password = passwordInput
+                        )
+                        when (result) {
+                            is GPodderConnectionTestResult.Success -> {
+                                Toast.makeText(context, "Connection test passed!", Toast.LENGTH_SHORT).show()
+                            }
+                            is GPodderConnectionTestResult.Error -> {
+                                Toast.makeText(context, "Test failed: ${result.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                },
+                enabled = !syncState.isTestingConnection && serverUrlInput.isNotBlank() && usernameInput.isNotBlank() && passwordInput.isNotBlank(),
+                modifier = Modifier.weight(1f)
+            ) {
+                if (syncState.isTestingConnection) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Testing...")
+                } else {
+                    Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Test Connection")
+                }
+            }
+
+            FilledTonalButton(
+                onClick = {
+                    subtleHaptic()
+                    keyboardController?.hide()
+                    val trimmedUrl = serverUrlInput.trim()
+                    val trimmedUser = usernameInput.trim()
+                    if (trimmedUrl.isBlank() || trimmedUser.isBlank() || passwordInput.isBlank()) {
+                        Toast.makeText(context, "Please enter server URL, username, and password", Toast.LENGTH_SHORT).show()
+                    } else {
+                        vm.saveGPodderConfig(
+                            enabled = syncState.config.enabled,
+                            serverType = serverTypeSelection,
+                            serverUrl = trimmedUrl,
+                            username = trimmedUser,
+                            password = passwordInput,
+                            intervalMinutes = selectedInterval.minutes
+                        )
+                        Toast.makeText(context, "Settings saved", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                modifier = Modifier.weight(0.7f)
+            ) {
+                Text("Save")
+            }
+        }
+
+        // Test Result Banner
+        syncState.testResult?.let { testResult ->
+            Spacer(Modifier.height(12.dp))
+            val isSuccess = testResult is GPodderConnectionTestResult.Success
+            val bgColor = if (isSuccess) {
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.55f)
+            } else {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.65f)
+            }
+            val contentColor = if (isSuccess) {
+                MaterialTheme.colorScheme.onPrimaryContainer
+            } else {
+                MaterialTheme.colorScheme.onErrorContainer
+            }
+            val icon = if (isSuccess) Icons.Default.CheckCircle else Icons.Default.Error
+            val message = when (testResult) {
+                is GPodderConnectionTestResult.Success -> {
+                    if (testResult.remoteSubscriptionCount != null) {
+                        "${testResult.message} (${testResult.remoteSubscriptionCount} remote subscriptions)"
+                    } else {
+                        testResult.message
+                    }
+                }
+                is GPodderConnectionTestResult.Error -> testResult.message
+            }
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = bgColor
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        icon,
+                        contentDescription = null,
+                        tint = contentColor,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = contentColor,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = {
+                            subtleHaptic()
+                            vm.clearGPodderTestResult()
+                        },
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Close,
+                            contentDescription = "Dismiss",
+                            tint = contentColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+        Spacer(Modifier.height(14.dp))
+
+        // Duration / Frequency Setting Section: 15 minutes, 30 minutes, 1 hour, 12 hours, 24 hours
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Schedule,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Column {
+                Text(
+                    text = "Sync Frequency",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = selectedInterval.description,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            GPodderSyncInterval.entries.forEach { interval ->
+                val isSelected = interval == selectedInterval
+                FilterChip(
+                    selected = isSelected,
+                    onClick = {
+                        subtleHaptic()
+                        vm.updateGPodderSyncInterval(interval.minutes)
+                    },
+                    label = {
+                        Text(interval.chipLabel)
+                    },
+                    leadingIcon = if (isSelected) {
+                        {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    } else null
+                )
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+        Spacer(Modifier.height(14.dp))
+
+        // Last Sync Status & Manual Sync Now Button
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Sync Status",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                if (syncState.lastSyncTimestampMs > 0L) {
+                    val relativeTime = android.text.format.DateUtils.getRelativeTimeSpanString(
+                        syncState.lastSyncTimestampMs,
+                        System.currentTimeMillis(),
+                        android.text.format.DateUtils.MINUTE_IN_MILLIS
+                    )
+                    Text(
+                        text = "Last synced: $relativeTime",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    if (!syncState.lastSyncMessage.isNullOrBlank()) {
+                        Text(
+                            text = syncState.lastSyncMessage.orEmpty(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (syncState.lastSyncSuccess == true) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.error
+                            },
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                } else {
+                    Text(
+                        text = if (isConfigured) "Never synced yet" else "Not configured",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Spacer(Modifier.width(8.dp))
+
+            Button(
+                onClick = {
+                    subtleHaptic()
+                    vm.syncGPodderNow { res ->
+                        when (res) {
+                            is GPodderSyncResult.Success -> {
+                                Toast.makeText(context, "Sync complete: ${res.message}", Toast.LENGTH_SHORT).show()
+                            }
+                            is GPodderSyncResult.Error -> {
+                                Toast.makeText(context, "Sync failed: ${res.message}", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    }
+                },
+                enabled = isConfigured && !syncState.isSyncing
+            ) {
+                if (syncState.isSyncing) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Syncing...")
+                } else {
+                    Icon(
+                        Icons.Default.Sync,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("Sync Now")
+                }
+            }
+        }
+
+        // Disconnect Account Option (if configured)
+        if (isConfigured) {
+            Spacer(Modifier.height(14.dp))
+            OutlinedButton(
+                onClick = {
+                    subtleHaptic()
+                    showDisconnectDialog = true
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                ),
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    MaterialTheme.colorScheme.error.copy(alpha = 0.5f)
+                )
+            ) {
+                Icon(
+                    Icons.Default.Delete,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("Disconnect gPodder Account")
+            }
+        }
+    }
+}
+
+@Composable
 private fun AutoArchiveCard(
     autoArchiveEnabled: Boolean,
     onToggle: (Boolean) -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     SettingCard {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable {
+                    subtleHaptic()
+                    onToggle(!autoArchiveEnabled)
+                },
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -3567,7 +6500,10 @@ private fun AutoArchiveCard(
             Spacer(Modifier.width(8.dp))
             Switch(
                 checked = autoArchiveEnabled,
-                onCheckedChange = onToggle
+                onCheckedChange = {
+                    subtleHaptic()
+                    onToggle(it)
+                }
             )
         }
     }
@@ -3578,6 +6514,7 @@ private fun DownloadsSettingsCard(
     downloadCount: Int,
     onRemoveAllDownloads: () -> Unit
 ) {
+    val subtleHaptic = rememberSubtleHaptic()
     var showConfirmDialog by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
@@ -3600,6 +6537,7 @@ private fun DownloadsSettingsCard(
             confirmButton = {
                 Button(
                     onClick = {
+                        subtleHaptic()
                         showConfirmDialog = false
                         onRemoveAllDownloads()
                         Toast.makeText(context, "All downloads removed", Toast.LENGTH_SHORT).show()
@@ -3610,7 +6548,10 @@ private fun DownloadsSettingsCard(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showConfirmDialog = false }) {
+                TextButton(onClick = {
+                    subtleHaptic()
+                    showConfirmDialog = false
+                }) {
                     Text("Cancel")
                 }
             }
@@ -3649,7 +6590,10 @@ private fun DownloadsSettingsCard(
             }
             Spacer(Modifier.width(8.dp))
             FilledTonalButton(
-                onClick = { showConfirmDialog = true },
+                onClick = {
+                    subtleHaptic()
+                    showConfirmDialog = true
+                },
                 enabled = downloadCount > 0,
                 colors = ButtonDefaults.filledTonalButtonColors(
                     contentColor = MaterialTheme.colorScheme.error
@@ -3668,17 +6612,376 @@ private fun DownloadsSettingsCard(
 }
 
 @Composable
-private fun AboutExpressoPodCard(
-    onClick: () -> Unit
+private fun LocalAudioFilesSettingsSection(
+    localFiles: List<LocalAudioFile>,
+    subscriptionTitle: String,
+    isImporting: Boolean,
+    currentPlayingUrl: String?,
+    isPlaying: Boolean,
+    onUpdateSubscriptionTitle: (String) -> Unit,
+    onAddAudioFiles: () -> Unit,
+    onRenameAudioFile: (String, String) -> Unit,
+    onDeleteAudioFile: (String) -> Unit,
+    onDeleteAllAudioFiles: () -> Unit,
+    onPlayAudioFile: (LocalAudioFile) -> Unit,
+    onOpenInSubscriptions: () -> Unit
 ) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-            .clickable(onClick = onClick)
-            .padding(18.dp)
-    ) {
+    val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    var titleText by remember(subscriptionTitle) { mutableStateOf(subscriptionTitle) }
+    var fileToRename by remember { mutableStateOf<LocalAudioFile?>(null) }
+    var renameText by remember { mutableStateOf("") }
+    var fileToDelete by remember { mutableStateOf<LocalAudioFile?>(null) }
+    var showDeleteAllConfirm by remember { mutableStateOf(false) }
+
+    // Ensure any un-saved non-blank title edits are persisted if the user navigates back
+    val currentTitleText by rememberUpdatedState(titleText)
+    val currentSavedTitle by rememberUpdatedState(subscriptionTitle)
+    val currentOnUpdateTitle by rememberUpdatedState(onUpdateSubscriptionTitle)
+    DisposableEffect(Unit) {
+        onDispose {
+            val trimmed = currentTitleText.trim()
+            if (trimmed.isNotBlank() && trimmed != currentSavedTitle) {
+                currentOnUpdateTitle(trimmed)
+            }
+        }
+    }
+
+    // Rename Dialog
+    fileToRename?.let { targetFile ->
+        AlertDialog(
+            onDismissRequest = { fileToRename = null },
+            icon = {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            },
+            title = {
+                Text("Rename Audio File", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Enter a new title for this audio file:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = renameText,
+                        onValueChange = { renameText = it },
+                        label = { Text("Audio Title") },
+                        singleLine = true,
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                        trailingIcon = {
+                            if (renameText.isNotEmpty()) {
+                                IconButton(onClick = {
+                                    subtleHaptic()
+                                    renameText = ""
+                                }) {
+                                    Icon(Icons.Default.Close, contentDescription = "Clear")
+                                }
+                            }
+                        },
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(
+                            onDone = {
+                                val cleaned = renameText.trim()
+                                if (cleaned.isNotBlank()) {
+                                    onRenameAudioFile(targetFile.id, cleaned)
+                                    Toast.makeText(context, "Renamed to \"$cleaned\"", Toast.LENGTH_SHORT).show()
+                                    fileToRename = null
+                                }
+                            }
+                        )
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        subtleHaptic()
+                        val cleaned = renameText.trim()
+                        if (cleaned.isNotBlank()) {
+                            onRenameAudioFile(targetFile.id, cleaned)
+                            Toast.makeText(context, "Renamed to \"$cleaned\"", Toast.LENGTH_SHORT).show()
+                            fileToRename = null
+                        }
+                    },
+                    enabled = renameText.trim().isNotBlank()
+                ) {
+                    Text("Save")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    subtleHaptic()
+                    fileToRename = null
+                }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Single File Delete Confirmation Dialog
+    fileToDelete?.let { targetFile ->
+        AlertDialog(
+            onDismissRequest = { fileToDelete = null },
+            icon = {
+                Icon(
+                    Icons.Default.DeleteOutline,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = {
+                Text("Delete Audio File?", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text("Remove \"${targetFile.title}\" from ExpressoPod?")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        subtleHaptic()
+                        val deletedTitle = targetFile.title
+                        onDeleteAudioFile(targetFile.id)
+                        fileToDelete = null
+                        Toast.makeText(context, "Deleted \"$deletedTitle\"", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    subtleHaptic()
+                    fileToDelete = null
+                }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // Delete All Confirmation Dialog
+    if (showDeleteAllConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteAllConfirm = false },
+            icon = {
+                Icon(
+                    Icons.Default.DeleteSweep,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.error
+                )
+            },
+            title = {
+                Text("Delete All Local Audio Files?", fontWeight = FontWeight.Bold)
+            },
+            text = {
+                Text("This will remove all ${localFiles.size} imported audio file(s) from ExpressoPod and remove the collection from Subscriptions.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        subtleHaptic()
+                        showDeleteAllConfirm = false
+                        onDeleteAllAudioFiles()
+                        Toast.makeText(context, "All local audio files deleted", Toast.LENGTH_SHORT).show()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Delete All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    subtleHaptic()
+                    showDeleteAllConfirm = false
+                }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    // 1. Subscription Title Customization Card
+    SettingCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Subscriptions,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text(
+                    text = "Title in Subscriptions",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "Customize the title that shows for these files on the Subscriptions screen",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        OutlinedTextField(
+            value = titleText,
+            onValueChange = { titleText = it },
+            label = { Text("Subscriptions Title") },
+            placeholder = { Text(LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE) },
+            singleLine = true,
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.fillMaxWidth(),
+            leadingIcon = {
+                Icon(Icons.Default.Edit, contentDescription = null)
+            },
+            trailingIcon = {
+                if (titleText.isNotEmpty()) {
+                    IconButton(onClick = {
+                        subtleHaptic()
+                        titleText = ""
+                    }) {
+                        Icon(Icons.Default.Close, contentDescription = "Clear title")
+                    }
+                }
+            },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+            keyboardActions = KeyboardActions(
+                onDone = {
+                    val finalTitle = titleText.trim().ifBlank { LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE }
+                    titleText = finalTitle
+                    onUpdateSubscriptionTitle(finalTitle)
+                    keyboardController?.hide()
+                    Toast.makeText(context, "Subscriptions title set to \"$finalTitle\"", Toast.LENGTH_SHORT).show()
+                }
+            )
+        )
+
+        Spacer(Modifier.height(10.dp))
+
+        val isTitleModified = titleText.trim() != subscriptionTitle
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Button(
+                onClick = {
+                    subtleHaptic()
+                    val finalTitle = titleText.trim().ifBlank { LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE }
+                    titleText = finalTitle
+                    onUpdateSubscriptionTitle(finalTitle)
+                    keyboardController?.hide()
+                    Toast.makeText(context, "Subscriptions title set to \"$finalTitle\"", Toast.LENGTH_SHORT).show()
+                },
+                enabled = isTitleModified || titleText.isBlank(),
+                shape = RoundedCornerShape(14.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Save Title")
+            }
+
+            if (subscriptionTitle != LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE) {
+                OutlinedButton(
+                    onClick = {
+                        subtleHaptic()
+                        titleText = LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE
+                        onUpdateSubscriptionTitle(LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE)
+                        keyboardController?.hide()
+                        Toast.makeText(context, "Reset to default title", Toast.LENGTH_SHORT).show()
+                    },
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Text("Reset")
+                }
+            }
+        }
+    }
+
+    // 2. Add Audio Files Card
+    SettingCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.AudioFile,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(24.dp)
+            )
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text(
+                    text = "Import Audio Files",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "Add audio files downloaded elsewhere on your device to play in Subscriptions",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        Button(
+            onClick = {
+                subtleHaptic()
+                onAddAudioFiles()
+            },
+            enabled = !isImporting,
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            if (isImporting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = MaterialTheme.colorScheme.onPrimary
+                )
+                Spacer(Modifier.width(8.dp))
+                Text("Importing Audio Files...")
+            } else {
+                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(20.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Add Audio Files", fontWeight = FontWeight.Bold)
+            }
+        }
+
+        if (localFiles.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            FilledTonalButton(
+                onClick = {
+                    subtleHaptic()
+                    onOpenInSubscriptions()
+                },
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Default.Subscriptions, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Open \"$subscriptionTitle\" in Subscriptions")
+            }
+        }
+    }
+
+    // 3. Added Audio Files List (Rename / Delete / Play)
+    SettingCard {
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
@@ -3689,23 +6992,205 @@ private fun AboutExpressoPodCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    Icons.Default.Info,
+                    Icons.Default.LibraryMusic,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Text(
-                    text = "About ExpressoPod",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
+                Column {
+                    Text(
+                        text = if (localFiles.isNotEmpty()) "Added Audio Files (${localFiles.size})" else "Added Audio Files",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = if (localFiles.isNotEmpty()) {
+                            "Rename or delete your imported audio files"
+                        } else {
+                            "Files you add will appear here and in Subscriptions"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            Icon(
-                Icons.AutoMirrored.Filled.ArrowForward,
-                contentDescription = "Open About Screen",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+
+            if (localFiles.size > 1) {
+                Spacer(Modifier.width(8.dp))
+                FilledTonalButton(
+                    onClick = {
+                        subtleHaptic()
+                        showDeleteAllConfirm = true
+                    },
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Icon(
+                        Icons.Default.DeleteSweep,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("Delete All")
+                }
+            }
+        }
+
+        Spacer(Modifier.height(14.dp))
+
+        if (localFiles.isEmpty()) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 24.dp, horizontal = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        Icons.Default.AudioFile,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.size(36.dp)
+                    )
+                    Text(
+                        text = "No audio files added yet",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "Tap 'Add Audio Files' above to import audio files from your device. Once added, they will appear automatically in your Subscriptions screen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+        } else {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                localFiles.forEach { file ->
+                    val isThisCurrent = currentPlayingUrl == file.audioUrl
+                    val isThisPlaying = isThisCurrent && isPlaying
+                    val metaParts = buildList {
+                        if (file.durationText.isNotBlank()) add(formatDurationText(file.durationText))
+                        if (file.sizeBytes > 0L) add(LocalAudioManager.formatBytes(file.sizeBytes))
+                        if (file.pubDate.isNotBlank()) add(file.pubDate)
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = if (isThisCurrent) {
+                            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f)
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.65f)
+                        },
+                        border = if (isThisCurrent) {
+                            BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+                        } else null,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            FilledTonalIconButton(
+                                onClick = {
+                                    subtleHaptic()
+                                    onPlayAudioFile(file)
+                                },
+                                modifier = Modifier.size(40.dp),
+                                colors = IconButtonDefaults.filledTonalIconButtonColors(
+                                    containerColor = if (isThisPlaying) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.primaryContainer,
+                                    contentColor = if (isThisPlaying) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary
+                                )
+                            ) {
+                                Icon(
+                                    if (isThisPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                    contentDescription = if (isThisPlaying) "Pause" else "Play",
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+
+                            Spacer(Modifier.width(12.dp))
+
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = file.title,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                if (metaParts.isNotEmpty()) {
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        text = metaParts.joinToString(" • "),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                val strippedOriginal = file.originalFileName.substringBeforeLast('.')
+                                if (file.originalFileName.isNotBlank() && !strippedOriginal.equals(file.title, ignoreCase = true)) {
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        text = "File: ${file.originalFileName}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.75f),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    subtleHaptic()
+                                    renameText = file.title
+                                    fileToRename = file
+                                },
+                                modifier = Modifier.size(38.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Edit,
+                                    contentDescription = "Rename ${file.title}",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+
+                            IconButton(
+                                onClick = {
+                                    subtleHaptic()
+                                    fileToDelete = file
+                                },
+                                modifier = Modifier.size(38.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.DeleteOutline,
+                                    contentDescription = "Delete ${file.title}",
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -3713,6 +7198,7 @@ private fun AboutExpressoPodCard(
 @Composable
 fun AboutScreen(onBack: () -> Unit) {
     val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
     val versionName = remember {
         try {
             val pInfo = context.packageManager.getPackageInfo(context.packageName, 0)
@@ -3737,12 +7223,15 @@ fun AboutScreen(onBack: () -> Unit) {
                 .padding(vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onBack) {
+            FilledTonalIconButton(onClick = {
+                subtleHaptic()
+                onBack()
+            }) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(12.dp))
             Text(
-                text = "About",
+                text = "About ExpressoPod",
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.Bold
             )
@@ -3835,7 +7324,22 @@ fun EpisodeRowCard(
     onCancelDownload: () -> Unit,
     onDeleteDownload: () -> Unit
 ) {
-    val baseColor = if (isCurrentlyPlaying) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f) else MaterialTheme.colorScheme.surfaceContainerHigh
+    val subtleHaptic = rememberSubtleHaptic()
+    val isDarkBg = (MaterialTheme.colorScheme.background.red * 0.299f +
+        MaterialTheme.colorScheme.background.green * 0.587f +
+        MaterialTheme.colorScheme.background.blue * 0.114f) < 0.5f
+
+    val playedBaseColor = if (isDarkBg) {
+        lerp(MaterialTheme.colorScheme.surfaceContainerLow, MaterialTheme.colorScheme.background, 0.35f)
+    } else {
+        lerp(MaterialTheme.colorScheme.surfaceDim, MaterialTheme.colorScheme.outlineVariant, 0.25f)
+    }
+
+    val baseColor = when {
+        isCurrentlyPlaying -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+        isPlayed -> playedBaseColor
+        else -> MaterialTheme.colorScheme.surfaceContainerHigh
+    }
     val cardColor = if (isSelected) {
         Color(
             red = baseColor.red * 0.65f,
@@ -3850,12 +7354,19 @@ fun EpisodeRowCard(
     Surface(
         shape = RoundedCornerShape(24.dp),
         color = cardColor,
-        border = if (isSelected) BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f)) else null,
+        border = when {
+            isSelected -> BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.5f))
+            isPlayed && !isCurrentlyPlaying -> BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
+            else -> null
+        },
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(24.dp))
             .combinedClickable(
-                onClick = onPlay,
+                onClick = {
+                    subtleHaptic()
+                    onPlay()
+                },
                 onLongClick = onLongClick
             )
     ) {
@@ -4007,12 +7518,41 @@ fun EpisodeRowCard(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (isDownloading) {
+                if (LocalAudioManager.isLocalPodcast(podcast)) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.65f)
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.AudioFile,
+                                contentDescription = "Local audio file",
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            if (downloadSize != null) {
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = downloadSize,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                            }
+                        }
+                    }
+                } else if (isDownloading) {
                     Box(
                         modifier = Modifier
                             .size(38.dp)
                             .clip(CircleShape)
-                            .clickable { onCancelDownload() },
+                            .clickable {
+                                subtleHaptic()
+                                onCancelDownload()
+                            },
                         contentAlignment = Alignment.Center
                     ) {
                         val progress = downloadProgress ?: 0f
@@ -4039,7 +7579,10 @@ fun EpisodeRowCard(
                     }
                 } else if (isDownloaded) {
                     IconButton(
-                        onClick = onDeleteDownload,
+                        onClick = {
+                            subtleHaptic()
+                            onDeleteDownload()
+                        },
                         modifier = Modifier.size(38.dp)
                     ) {
                         Icon(
@@ -4051,7 +7594,10 @@ fun EpisodeRowCard(
                     }
                 } else {
                     IconButton(
-                        onClick = onDownload,
+                        onClick = {
+                            subtleHaptic()
+                            onDownload()
+                        },
                         modifier = Modifier.size(38.dp)
                     ) {
                         Icon(
@@ -4063,7 +7609,10 @@ fun EpisodeRowCard(
                 }
 
                 IconButton(
-                    onClick = onAddToUpNext,
+                    onClick = {
+                        subtleHaptic()
+                        onAddToUpNext()
+                    },
                     modifier = Modifier.size(38.dp)
                 ) {
                     Icon(
@@ -4075,7 +7624,10 @@ fun EpisodeRowCard(
                 }
 
                 IconButton(
-                    onClick = onTogglePlayed,
+                    onClick = {
+                        subtleHaptic()
+                        onTogglePlayed()
+                    },
                     modifier = Modifier.size(38.dp)
                 ) {
                     Icon(
@@ -4088,7 +7640,10 @@ fun EpisodeRowCard(
 
                 if (!isKeepUnarchived) {
                     IconButton(
-                        onClick = onToggleArchive,
+                        onClick = {
+                            subtleHaptic()
+                            onToggleArchive()
+                        },
                         modifier = Modifier.size(38.dp)
                     ) {
                         Icon(
@@ -4103,7 +7658,10 @@ fun EpisodeRowCard(
                 if (isAutoArchiveEnabled || isKeepUnarchived) {
                     if (isKeepUnarchived) {
                         FilledTonalIconButton(
-                            onClick = onToggleKeepUnarchived,
+                            onClick = {
+                                subtleHaptic()
+                                onToggleKeepUnarchived()
+                            },
                             modifier = Modifier.size(38.dp),
                             shape = CircleShape,
                             colors = IconButtonDefaults.filledTonalIconButtonColors(
@@ -4119,7 +7677,10 @@ fun EpisodeRowCard(
                         }
                     } else {
                         IconButton(
-                            onClick = onToggleKeepUnarchived,
+                            onClick = {
+                                subtleHaptic()
+                                onToggleKeepUnarchived()
+                            },
                             modifier = Modifier.size(38.dp)
                         ) {
                             Icon(
@@ -4140,6 +7701,7 @@ fun EpisodeRowCard(
 fun PodcastOptionsMenu(
     podcast: Podcast,
     episodes: List<Episode>,
+    allEpisodes: List<Episode> = episodes,
     downloadedEpisodes: List<DownloadedEpisode>,
     activeDownloads: Map<String, Float>,
     archivedEpisodes: Set<String>,
@@ -4151,9 +7713,11 @@ fun PodcastOptionsMenu(
     onClearSelection: () -> Unit = {},
     onDownloadAll: (List<Episode>) -> Unit,
     onArchiveAll: (List<Episode>) -> Unit,
-    onUnarchiveAll: (List<Episode>) -> Unit = {}
+    onUnarchiveAll: (List<Episode>) -> Unit = {},
+    onOpenLocalAudioSettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
     var expanded by remember { mutableStateOf(false) }
 
     val hasSelected = selectedEpisodeUrls.isNotEmpty()
@@ -4161,6 +7725,13 @@ fun PodcastOptionsMenu(
         episodes.filter { selectedEpisodeUrls.contains(it.audioUrl) }
     } else {
         episodes
+    }
+    val downloadCandidates = if (hasSelected) {
+        candidateEpisodes
+    } else if (filterMode == 2 && allEpisodes.isNotEmpty()) {
+        allEpisodes
+    } else {
+        candidateEpisodes
     }
 
     val selectedArchivedCount = candidateEpisodes.count { archivedEpisodes.contains(it.audioUrl) }
@@ -4173,7 +7744,10 @@ fun PodcastOptionsMenu(
     }
 
     Box {
-        IconButton(onClick = { expanded = true }) {
+        IconButton(onClick = {
+            subtleHaptic()
+            expanded = true
+        }) {
             Icon(Icons.Default.MoreVert, contentDescription = "Podcast options")
         }
         DropdownMenu(
@@ -4187,39 +7761,57 @@ fun PodcastOptionsMenu(
                         Icon(Icons.Default.SelectAll, contentDescription = null)
                     },
                     onClick = {
+                        subtleHaptic()
                         expanded = false
                         onSelectAll()
                     }
                 )
             }
-            DropdownMenuItem(
-                text = { Text(if (hasSelected) "Download Selected" else "Download All") },
-                leadingIcon = {
-                    Icon(Icons.Default.Download, contentDescription = null)
-                },
-                onClick = {
-                    expanded = false
-                    val toDownload = candidateEpisodes.filter { ep ->
-                        !downloadedEpisodes.any { it.audioUrl == ep.audioUrl } && !activeDownloads.containsKey(ep.audioUrl)
-                    }
-                    if (toDownload.isNotEmpty()) {
-                        onDownloadAll(toDownload)
-                        Toast.makeText(
-                            context,
-                            if (hasSelected) "Downloading ${toDownload.size} selected episode(s)..." else "Downloading ${toDownload.size} episode(s)...",
-                            Toast.LENGTH_SHORT
-                        ).show()
+            if (LocalAudioManager.isLocalPodcast(podcast)) {
+                DropdownMenuItem(
+                    text = { Text("Manage Local Audio Files") },
+                    leadingIcon = {
+                        Icon(Icons.Default.AudioFile, contentDescription = null)
+                    },
+                    onClick = {
+                        subtleHaptic()
+                        expanded = false
                         onClearSelection()
-                    } else {
-                        Toast.makeText(
-                            context,
-                            if (hasSelected) "Selected episode(s) are already downloaded" else "All episodes are already downloaded",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                        onClearSelection()
+                        onOpenLocalAudioSettings()
                     }
-                }
-            )
+                )
+            } else {
+                DropdownMenuItem(
+                    text = { Text(if (hasSelected) "Download Selected" else "Download All") },
+                    leadingIcon = {
+                        Icon(Icons.Default.Download, contentDescription = null)
+                    },
+                    onClick = {
+                        subtleHaptic()
+                        expanded = false
+                        val toDownload = downloadCandidates.filter { ep ->
+                            val cleanUrl = ep.audioUrl.trim()
+                            !downloadedEpisodes.any { it.audioUrl == cleanUrl && java.io.File(it.localPath).exists() } && !activeDownloads.containsKey(cleanUrl)
+                        }
+                        if (toDownload.isNotEmpty()) {
+                            onDownloadAll(toDownload)
+                            Toast.makeText(
+                                context,
+                                if (hasSelected) "Downloading ${toDownload.size} selected episode(s)..." else "Downloading ${toDownload.size} episode(s)...",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            onClearSelection()
+                        } else {
+                            Toast.makeText(
+                                context,
+                                if (hasSelected) "Selected episode(s) are already downloaded" else "All episodes are already downloaded",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            onClearSelection()
+                        }
+                    }
+                )
+            }
             if (isUnarchive) {
                 DropdownMenuItem(
                     text = { Text(if (hasSelected) "Unarchive Selected" else "Unarchive All") },
@@ -4227,6 +7819,7 @@ fun PodcastOptionsMenu(
                         Icon(Icons.Default.Unarchive, contentDescription = null)
                     },
                     onClick = {
+                        subtleHaptic()
                         expanded = false
                         val toUnarchive = candidateEpisodes.filter { archivedEpisodes.contains(it.audioUrl) }
                         if (toUnarchive.isNotEmpty()) {
@@ -4254,6 +7847,7 @@ fun PodcastOptionsMenu(
                         Icon(Icons.Default.Archive, contentDescription = null)
                     },
                     onClick = {
+                        subtleHaptic()
                         expanded = false
                         val toArchive = candidateEpisodes.filter { 
                             !archivedEpisodes.contains(it.audioUrl) && !keepUnarchivedEpisodes.contains(it.audioUrl) 
@@ -4322,17 +7916,22 @@ fun PodcastDetailView(
     episodes: List<Episode>,
     vm: PodcastViewModel,
     onBack: () -> Unit,
-    onEpisodeSelected: (Podcast, Episode) -> Unit
+    onEpisodeSelected: (Podcast, Episode) -> Unit,
+    onOpenLocalAudioSettings: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
+    val subtleHaptic = rememberSubtleHaptic()
     val archivedEpisodes by vm.archivedEpisodes.collectAsState()
     val playedEpisodes by vm.playedEpisodes.collectAsState()
     val downloadedEpisodes by vm.downloadedEpisodes.collectAsState()
+    val localAudioFiles by vm.localAudioFiles.collectAsState()
     val activeDownloads by vm.activeDownloads.collectAsState()
     val keepUnarchivedEpisodes by vm.keepUnarchivedEpisodes.collectAsState()
     val autoArchiveEnabled by vm.autoArchiveEnabled.collectAsState()
     val subscriptions by vm.subscriptions.collectAsState()
+
+    val localAudioSet = remember(localAudioFiles) { localAudioFiles.map { it.audioUrl }.toSet() }
 
     var selectedTab by rememberSaveable(podcast.feedUrl) { mutableIntStateOf(0) } // 0: Episodes, 1: Podcast Info
     var showArchived by rememberSaveable(podcast.feedUrl) { mutableStateOf(false) }
@@ -4349,11 +7948,14 @@ fun PodcastDetailView(
         }
     }
 
+    val uniqueEpisodes = remember(episodes) {
+        episodes.filter { it.audioUrl.isNotBlank() }.distinctBy { it.audioUrl }
+    }
     val displayedEpisodes = when (filterMode) {
-        1 -> episodes.filter { ep -> !playedEpisodes.contains(ep.audioUrl) && !archivedEpisodes.contains(ep.audioUrl) }
-        2 -> episodes.filter { ep -> downloadedEpisodes.any { it.audioUrl == ep.audioUrl } }
-        3 -> episodes.filter { ep -> archivedEpisodes.contains(ep.audioUrl) }
-        else -> if (showArchived) episodes else episodes.filter { ep -> !archivedEpisodes.contains(ep.audioUrl) }
+        1 -> uniqueEpisodes.filter { ep -> !playedEpisodes.contains(ep.audioUrl) && !archivedEpisodes.contains(ep.audioUrl) }
+        2 -> uniqueEpisodes.filter { ep -> downloadedEpisodes.any { it.audioUrl == ep.audioUrl } || localAudioSet.contains(ep.audioUrl) }
+        3 -> uniqueEpisodes.filter { ep -> archivedEpisodes.contains(ep.audioUrl) }
+        else -> if (showArchived) uniqueEpisodes else uniqueEpisodes.filter { ep -> !archivedEpisodes.contains(ep.audioUrl) }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
@@ -4365,7 +7967,10 @@ fun PodcastDetailView(
                 .padding(vertical = 4.dp)
         ) {
             if (selectedEpisodeUrls.isNotEmpty()) {
-                IconButton(onClick = { selectedEpisodeUrls = emptySet() }) {
+                IconButton(onClick = {
+                    subtleHaptic()
+                    selectedEpisodeUrls = emptySet()
+                }) {
                     Icon(Icons.Default.Close, contentDescription = "Clear selection")
                 }
                 Spacer(Modifier.width(8.dp))
@@ -4376,22 +7981,42 @@ fun PodcastDetailView(
                     modifier = Modifier.weight(1f)
                 )
             } else {
-                FilledTonalIconButton(onClick = onBack) {
+                FilledTonalIconButton(onClick = {
+                    subtleHaptic()
+                    onBack()
+                }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                 }
                 Spacer(Modifier.weight(1f))
-                val isSubscribed = subscriptions.any { it.feedUrl == podcast.feedUrl }
-                IconButton(onClick = { vm.toggleSubscription(podcast) }) {
-                    Icon(
-                        if (isSubscribed) Icons.Default.Star else Icons.Default.StarBorder,
-                        contentDescription = if (isSubscribed) "Unsubscribe" else "Subscribe",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
+                if (LocalAudioManager.isLocalPodcast(podcast)) {
+                    IconButton(onClick = {
+                        subtleHaptic()
+                        onOpenLocalAudioSettings()
+                    }) {
+                        Icon(
+                            Icons.Default.Edit,
+                            contentDescription = "Manage Local Audio Files",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                } else {
+                    val isSubscribed = subscriptions.any { it.feedUrl == podcast.feedUrl }
+                    IconButton(onClick = {
+                        subtleHaptic()
+                        vm.toggleSubscription(podcast)
+                    }) {
+                        Icon(
+                            if (isSubscribed) Icons.Default.Star else Icons.Default.StarBorder,
+                            contentDescription = if (isSubscribed) "Unsubscribe" else "Subscribe",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
             }
             PodcastOptionsMenu(
                 podcast = podcast,
                 episodes = displayedEpisodes,
+                allEpisodes = if (showArchived) uniqueEpisodes else uniqueEpisodes.filter { ep -> !archivedEpisodes.contains(ep.audioUrl) },
                 downloadedEpisodes = downloadedEpisodes,
                 activeDownloads = activeDownloads,
                 archivedEpisodes = archivedEpisodes,
@@ -4403,22 +8028,63 @@ fun PodcastDetailView(
                 onClearSelection = { selectedEpisodeUrls = emptySet() },
                 onDownloadAll = { vm.downloadAllEpisodes(podcast, it) },
                 onArchiveAll = { vm.archiveAllEpisodes(it) },
-                onUnarchiveAll = { vm.unarchiveAllEpisodes(it) }
+                onUnarchiveAll = { vm.unarchiveAllEpisodes(it) },
+                onOpenLocalAudioSettings = onOpenLocalAudioSettings
             )
         }
+
+        val detailConfig = LocalConfiguration.current
+        val isCompactDetail = detailConfig.screenHeightDp < 840 || detailConfig.screenWidthDp < 370
+
+        val (savedIndex, savedOffset) = remember(podcast.feedUrl) {
+            vm.getEpisodeListPosition(podcast.feedUrl)
+        }
+        val episodeListState = rememberSaveable(podcast.feedUrl, saver = LazyListState.Saver) {
+            LazyListState(savedIndex, savedOffset)
+        }
+
+        val isScrolled by remember {
+            derivedStateOf {
+                episodeListState.firstVisibleItemIndex > 0 || episodeListState.firstVisibleItemScrollOffset > 30
+            }
+        }
+        val shouldShrinkHeader = selectedTab == 0 && isScrolled
+
+        val maxArtSize = if (isCompactDetail) 116.dp else 140.dp
+        val minArtSize = if (isCompactDetail) 56.dp else 66.dp
+        val animatedArtSize by animateDpAsState(
+            targetValue = if (shouldShrinkHeader) minArtSize else maxArtSize,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
+            label = "headerArtSize"
+        )
+        val animatedCorner by animateDpAsState(
+            targetValue = if (shouldShrinkHeader) 14.dp else (if (isCompactDetail) 22.dp else 26.dp),
+            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
+            label = "headerCorner"
+        )
+        val animatedTitleSize by animateFloatAsState(
+            targetValue = if (shouldShrinkHeader) 15f else (if (isCompactDetail) 18f else 22f),
+            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
+            label = "headerTitleSize"
+        )
+        val animatedSpacerHeight by animateDpAsState(
+            targetValue = if (shouldShrinkHeader) 4.dp else (if (isCompactDetail) 6.dp else 10.dp),
+            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
+            label = "headerSpacerHeight"
+        )
 
         // Centered Podcast Artwork & Title Header
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(top = 2.dp, bottom = 10.dp),
+                .padding(top = 2.dp, bottom = if (shouldShrinkHeader) 4.dp else (if (isCompactDetail) 6.dp else 10.dp)),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Surface(
-                shape = RoundedCornerShape(20.dp),
-                shadowElevation = 4.dp,
+                shape = RoundedCornerShape(animatedCorner),
+                shadowElevation = if (shouldShrinkHeader) 2.dp else 4.dp,
                 tonalElevation = 2.dp,
-                modifier = Modifier.size(104.dp)
+                modifier = Modifier.size(animatedArtSize)
             ) {
                 AsyncImage(
                     model = podcast.artworkUrl,
@@ -4430,29 +8096,34 @@ fun PodcastDetailView(
                 )
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            Spacer(modifier = Modifier.height(animatedSpacerHeight))
 
             Text(
                 text = podcast.title,
-                style = MaterialTheme.typography.titleLarge,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontSize = animatedTitleSize.sp,
+                    lineHeight = (animatedTitleSize * 1.25f).sp
+                ),
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
-                maxLines = 2,
+                maxLines = if (shouldShrinkHeader) 1 else 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(horizontal = 16.dp)
             )
 
-            if (podcast.author.isNotBlank() && podcast.author != "Unknown") {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    text = podcast.author,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(horizontal = 24.dp)
-                )
+            AnimatedVisibility(visible = !shouldShrinkHeader && podcast.author.isNotBlank() && podcast.author != "Unknown") {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = podcast.author,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 24.dp)
+                    )
+                }
             }
         }
 
@@ -4467,7 +8138,10 @@ fun PodcastDetailView(
         ) {
             Tab(
                 selected = selectedTab == 0,
-                onClick = { selectedTab = 0 },
+                onClick = {
+                    subtleHaptic()
+                    selectedTab = 0
+                },
                 text = {
                     Text(
                         if (episodes.isNotEmpty()) "Episodes (${episodes.size})" else "Episodes",
@@ -4479,7 +8153,10 @@ fun PodcastDetailView(
             )
             Tab(
                 selected = selectedTab == 1,
-                onClick = { selectedTab = 1 },
+                onClick = {
+                    subtleHaptic()
+                    selectedTab = 1
+                },
                 text = {
                     Text(
                         "Podcast Info",
@@ -4507,13 +8184,6 @@ fun PodcastDetailView(
             when (selectedTab) {
                 0 -> {
                     // Episodes Tab
-                    val (savedIndex, savedOffset) = remember(podcast.feedUrl) {
-                        vm.getEpisodeListPosition(podcast.feedUrl)
-                    }
-                    val episodeListState = rememberSaveable(podcast.feedUrl, saver = LazyListState.Saver) {
-                        LazyListState(savedIndex, savedOffset)
-                    }
-
                     LaunchedEffect(episodeListState) {
                         snapshotFlow { episodeListState.firstVisibleItemIndex }
                             .distinctUntilChanged()
@@ -4529,7 +8199,7 @@ fun PodcastDetailView(
                     val downloadedSet = remember(downloadedEpisodes) { downloadedEpisodes.map { it.audioUrl }.toSet() }
                     val unarchivedCount = episodes.count { ep -> !archivedEpisodes.contains(ep.audioUrl) }
                     val unplayedCount = episodes.count { ep -> !playedEpisodes.contains(ep.audioUrl) && !archivedEpisodes.contains(ep.audioUrl) }
-                    val downloadedCount = episodes.count { ep -> downloadedSet.contains(ep.audioUrl) }
+                    val downloadedCount = episodes.count { ep -> downloadedSet.contains(ep.audioUrl) || localAudioSet.contains(ep.audioUrl) }
                     val archivedCount = episodes.count { ep -> archivedEpisodes.contains(ep.audioUrl) }
 
                     Row(
@@ -4542,7 +8212,10 @@ fun PodcastDetailView(
                     ) {
                         FilterChip(
                             selected = filterMode == 0,
-                            onClick = { filterMode = 0 },
+                            onClick = {
+                                subtleHaptic()
+                                filterMode = 0
+                            },
                             label = { Text(if (showArchived) "All (${episodes.size})" else "All ($unarchivedCount)") },
                             leadingIcon = if (filterMode == 0) {
                                 { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(16.dp)) }
@@ -4551,7 +8224,10 @@ fun PodcastDetailView(
                         )
                         FilterChip(
                             selected = filterMode == 1,
-                            onClick = { filterMode = 1 },
+                            onClick = {
+                                subtleHaptic()
+                                filterMode = 1
+                            },
                             label = { Text("Unplayed ($unplayedCount)") },
                             leadingIcon = if (filterMode == 1) {
                                 { Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp)) }
@@ -4560,7 +8236,10 @@ fun PodcastDetailView(
                         )
                         FilterChip(
                             selected = filterMode == 2,
-                            onClick = { filterMode = 2 },
+                            onClick = {
+                                subtleHaptic()
+                                filterMode = 2
+                            },
                             label = { Text("Downloaded ($downloadedCount)") },
                             leadingIcon = {
                                 Icon(
@@ -4573,7 +8252,10 @@ fun PodcastDetailView(
                         )
                         FilterChip(
                             selected = filterMode == 3,
-                            onClick = { filterMode = 3 },
+                            onClick = {
+                                subtleHaptic()
+                                filterMode = 3
+                            },
                             label = { Text("Archived ($archivedCount)") },
                             leadingIcon = if (filterMode == 3) {
                                 { Icon(Icons.Default.Archive, contentDescription = null, modifier = Modifier.size(16.dp)) }
@@ -4583,6 +8265,7 @@ fun PodcastDetailView(
                         FilterChip(
                             selected = showArchived,
                             onClick = {
+                                subtleHaptic()
                                 showArchived = !showArchived
                                 if (filterMode == 3 && !showArchived) {
                                     filterMode = 0
@@ -4690,7 +8373,7 @@ fun PodcastDetailView(
 
                                 val isKeepUnarchived = keepUnarchivedEpisodes.contains(ep.audioUrl)
                                 val isSelected = selectedEpisodeUrls.contains(ep.audioUrl)
-                                val isInUpNext = vm.upNextQueue.any { it.episode.audioUrl == ep.audioUrl }
+                                val isInUpNext = isCurrent || vm.upNextQueue.any { it.episode.audioUrl == ep.audioUrl }
 
                                 EpisodeRowCard(
                                     podcast = podcast,
@@ -4859,6 +8542,7 @@ fun PodcastDetailView(
                                             .fillMaxWidth()
                                             .clip(RoundedCornerShape(12.dp))
                                             .clickable {
+                                                subtleHaptic()
                                                 SecurityUtils.openSafeUrl(context, websiteUrl)
                                             }
                                             .padding(vertical = 4.dp),
@@ -4893,110 +8577,219 @@ fun PodcastDetailView(
                         }
 
                         // Feed & Subscription Card
-                        Card(
-                            shape = RoundedCornerShape(24.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f)),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 16.dp)
-                        ) {
-                            Column(modifier = Modifier.padding(18.dp)) {
-                                Text(
-                                    text = "Feed & Subscription",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Spacer(modifier = Modifier.height(12.dp))
-
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(
-                                        Icons.Default.RssFeed,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(20.dp),
-                                        tint = MaterialTheme.colorScheme.primary
+                        if (LocalAudioManager.isLocalPodcast(podcast)) {
+                            Card(
+                                shape = RoundedCornerShape(24.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 16.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(18.dp)) {
+                                    Text(
+                                        text = "Local Audio Collection",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
                                     )
-                                    Spacer(modifier = Modifier.width(12.dp))
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text("RSS Feed URL", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        Text(
-                                            text = podcast.feedUrl,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurface,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                    IconButton(
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Text(
+                                        text = "Add new files, rename or delete existing files, or customize the title shown in Subscriptions.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                    Spacer(modifier = Modifier.height(14.dp))
+                                    FilledTonalButton(
                                         onClick = {
-                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                            clipboard.setPrimaryClip(ClipData.newPlainText("RSS Feed URL", podcast.feedUrl))
-                                            Toast.makeText(context, "RSS feed URL copied to clipboard", Toast.LENGTH_SHORT).show()
-                                        }
+                                            subtleHaptic()
+                                            onOpenLocalAudioSettings()
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(16.dp)
                                     ) {
-                                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy RSS Feed URL", tint = MaterialTheme.colorScheme.primary)
+                                        Icon(
+                                            Icons.Default.AudioFile,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Manage Local Audio Files")
                                     }
                                 }
-
-                                Spacer(modifier = Modifier.height(12.dp))
-
-                                val isSubscribed = subscriptions.any { it.feedUrl == podcast.feedUrl }
-                                FilledTonalButton(
-                                    onClick = { vm.toggleSubscription(podcast) },
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = RoundedCornerShape(16.dp)
-                                ) {
-                                    Icon(
-                                        if (isSubscribed) Icons.Default.Star else Icons.Default.StarBorder,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
+                            }
+                        } else {
+                            Card(
+                                shape = RoundedCornerShape(24.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f)),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 16.dp)
+                            ) {
+                                Column(modifier = Modifier.padding(18.dp)) {
+                                    Text(
+                                        text = "Feed & Subscription",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary
                                     )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(if (isSubscribed) "Subscribed (Tap to unsubscribe)" else "Subscribe to Podcast")
-                                }
+                                    Spacer(modifier = Modifier.height(12.dp))
 
-                                if (isSubscribed) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.RssFeed,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(20.dp),
+                                            tint = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(modifier = Modifier.width(12.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Text("RSS Feed URL", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                            Text(
+                                                text = podcast.feedUrl,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = {
+                                                subtleHaptic()
+                                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                                clipboard.setPrimaryClip(ClipData.newPlainText("RSS Feed URL", podcast.feedUrl))
+                                                Toast.makeText(context, "RSS feed URL copied to clipboard", Toast.LENGTH_SHORT).show()
+                                            }
+                                        ) {
+                                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy RSS Feed URL", tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    }
+
                                     Spacer(modifier = Modifier.height(10.dp))
-                                    val mutedPodcasts by vm.mutedNotificationPodcasts.collectAsState()
-                                    val isNotified = !mutedPodcasts.contains(podcast.feedUrl)
+
+                                    val authenticatedFeeds by vm.authenticatedFeedUrls.collectAsState()
+                                    val normalizedFeedKey = remember(podcast.feedUrl) { FeedCredentialsManager.normalizeUrlKey(podcast.feedUrl) }
+                                    val hasCredentials = authenticatedFeeds.contains(normalizedFeedKey)
+                                    val savedCreds = remember(podcast.feedUrl, authenticatedFeeds) {
+                                        FeedCredentialsManager.getCredentials(podcast.feedUrl)
+                                    }
+
                                     Row(
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .clip(RoundedCornerShape(14.dp))
                                             .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.5f))
-                                            .clickable { vm.togglePodcastNotification(podcast.feedUrl, !isNotified) }
+                                            .clickable {
+                                                subtleHaptic()
+                                                vm.openEditFeedCredentialsDialog(podcast)
+                                            }
                                             .padding(horizontal = 14.dp, vertical = 10.dp),
                                         verticalAlignment = Alignment.CenterVertically,
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
                                         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                                             Icon(
-                                                if (isNotified) Icons.Default.NotificationsActive else Icons.Default.NotificationsOff,
+                                                if (hasCredentials) Icons.Default.Lock else Icons.Default.LockOpen,
                                                 contentDescription = null,
                                                 modifier = Modifier.size(20.dp),
-                                                tint = if (isNotified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                                tint = if (hasCredentials) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                             Spacer(modifier = Modifier.width(10.dp))
                                             Column {
                                                 Text(
-                                                    "New Episode Notifications",
+                                                    "Feed Authentication",
                                                     style = MaterialTheme.typography.bodyMedium,
                                                     fontWeight = FontWeight.SemiBold
                                                 )
                                                 Text(
-                                                    if (isNotified) "Notifying on new releases" else "Notifications muted",
+                                                    if (hasCredentials && !savedCreds?.username.isNullOrBlank()) {
+                                                        "Authenticated as ${savedCreds?.username} (Tap to edit)"
+                                                    } else if (hasCredentials) {
+                                                        "Password configured (Tap to edit)"
+                                                    } else {
+                                                        "No login configured (Tap to set username/password)"
+                                                    },
                                                     style = MaterialTheme.typography.bodySmall,
-                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    color = if (hasCredentials) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
                                             }
                                         }
-                                        Switch(
-                                            checked = isNotified,
-                                            onCheckedChange = { checked -> vm.togglePodcastNotification(podcast.feedUrl, checked) }
+                                        Icon(
+                                            Icons.Default.Edit,
+                                            contentDescription = "Edit Feed Credentials",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = MaterialTheme.colorScheme.primary
                                         )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+
+                                    val isSubscribed = subscriptions.any { it.feedUrl == podcast.feedUrl }
+                                    FilledTonalButton(
+                                        onClick = {
+                                            subtleHaptic()
+                                            vm.toggleSubscription(podcast)
+                                        },
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(16.dp)
+                                    ) {
+                                        Icon(
+                                            if (isSubscribed) Icons.Default.Star else Icons.Default.StarBorder,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text(if (isSubscribed) "Subscribed (Tap to unsubscribe)" else "Subscribe to Podcast")
+                                    }
+
+                                    if (isSubscribed) {
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        val mutedPodcasts by vm.mutedNotificationPodcasts.collectAsState()
+                                        val isNotified = !mutedPodcasts.contains(podcast.feedUrl)
+                                        Row(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clip(RoundedCornerShape(14.dp))
+                                                .background(MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.5f))
+                                                .clickable {
+                                                    subtleHaptic()
+                                                    vm.togglePodcastNotification(podcast.feedUrl, !isNotified)
+                                                }
+                                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween
+                                        ) {
+                                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
+                                                Icon(
+                                                    if (isNotified) Icons.Default.NotificationsActive else Icons.Default.NotificationsOff,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(20.dp),
+                                                    tint = if (isNotified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                                Spacer(modifier = Modifier.width(10.dp))
+                                                Column {
+                                                    Text(
+                                                        "New Episode Notifications",
+                                                        style = MaterialTheme.typography.bodyMedium,
+                                                        fontWeight = FontWeight.SemiBold
+                                                    )
+                                                    Text(
+                                                        if (isNotified) "Notifying on new releases" else "Notifications muted",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                    )
+                                                }
+                                            }
+                                            Switch(
+                                                checked = isNotified,
+                                                onCheckedChange = { checked ->
+                                                    subtleHaptic()
+                                                    vm.togglePodcastNotification(podcast.feedUrl, checked)
+                                                }
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -5008,10 +8801,12 @@ fun PodcastDetailView(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -> Unit) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    val subtleHaptic = rememberSubtleHaptic()
 
     Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         if (vm.discoverSelectedPodcast != null) {
@@ -5034,18 +8829,20 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                 },
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(28.dp),
-                placeholder = { Text("Search podcasts...") },
+                placeholder = { Text("Search podcasts or paste RSS URL...") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(
                     imeAction = ImeAction.Done
                 ),
                 keyboardActions = KeyboardActions(
                     onDone = {
+                        subtleHaptic()
                         keyboardController?.hide()
                         vm.discoverSelectedPodcast = null
                         vm.search()
                     },
                     onSearch = {
+                        subtleHaptic()
                         keyboardController?.hide()
                         vm.discoverSelectedPodcast = null
                         vm.search()
@@ -5057,12 +8854,16 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                 trailingIcon = {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         if (vm.searchQuery.isNotBlank()) {
-                            IconButton(onClick = { vm.clearSearch() }) {
+                            IconButton(onClick = {
+                                subtleHaptic()
+                                vm.clearSearch()
+                            }) {
                                 Icon(Icons.Default.Close, contentDescription = "Clear search")
                             }
                         }
                         FilledIconButton(
                             onClick = {
+                                subtleHaptic()
                                 keyboardController?.hide()
                                 vm.discoverSelectedPodcast = null
                                 vm.search()
@@ -5075,7 +8876,32 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                 }
             )
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Start
+            ) {
+                AssistChip(
+                    onClick = {
+                        subtleHaptic()
+                        val prefill = if (SecurityUtils.looksLikeFeedUrl(vm.searchQuery)) vm.searchQuery else ""
+                        vm.openAddCustomFeedDialog(initialUrl = prefill)
+                    },
+                    label = { Text("Add Custom / Private RSS Feed") },
+                    leadingIcon = {
+                        Icon(
+                            Icons.Default.RssFeed,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp),
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    },
+                    shape = RoundedCornerShape(16.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
 
             vm.errorMessage?.let { msg ->
                 Card(
@@ -5099,13 +8925,19 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
             } else if (vm.podcasts.isNotEmpty()) {
                 // Podcast Search Results List
                 LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(vm.podcasts, key = { it.feedUrl }) { podcast ->
+                    itemsIndexed(
+                        items = vm.podcasts,
+                        key = { index, podcast -> "${podcast.feedUrl}_$index" }
+                    ) { _, podcast ->
                         Surface(
                             shape = RoundedCornerShape(28.dp),
                             color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.6f),
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { vm.loadDiscoverPodcastEpisodes(podcast) }
+                                .clickable {
+                                    subtleHaptic()
+                                    vm.loadDiscoverPodcastEpisodes(podcast)
+                                }
                         ) {
                             Row(
                                 modifier = Modifier.padding(14.dp),
@@ -5140,33 +8972,121 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                     }
                 }
             } else {
-                // Empty Discover State
-                Box(
+                // Suggested Podcasts Grid
+                val subscriptions by vm.subscriptions.collectAsState()
+                val subscribedUrls = remember(subscriptions) { subscriptions.map { it.feedUrl }.toSet() }
+
+                LaunchedEffect(Unit) {
+                    if (!vm.hasLoadedOnlineSuggestions && !vm.isLoadingSuggestions) {
+                        vm.loadSuggestedPodcasts()
+                    }
+                }
+
+                Row(
                     modifier = Modifier
-                        .fillMaxSize()
-                        .padding(32.dp),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(
-                            Icons.Default.Explore,
-                            contentDescription = null,
-                            modifier = Modifier.size(56.dp),
-                            tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f)
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        Text(
-                            "Discover Podcasts",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            "Search millions of shows across Apple Podcasts & RSS feeds.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            textAlign = TextAlign.Center
-                        )
+                    Icon(
+                        Icons.Default.AutoAwesome,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Text(
+                        text = "Suggested Podcasts",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                androidx.compose.material3.pulltorefresh.PullToRefreshBox(
+                    isRefreshing = vm.isLoadingSuggestions,
+                    onRefresh = {
+                        subtleHaptic()
+                        vm.refreshSuggestedPodcasts()
+                    },
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    androidx.compose.foundation.lazy.grid.LazyVerticalGrid(
+                        columns = androidx.compose.foundation.lazy.grid.GridCells.Adaptive(minSize = 110.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(
+                            items = vm.suggestedPodcasts,
+                            key = { it.feedUrl }
+                        ) { podcast ->
+                            val isSubscribed = subscribedUrls.contains(podcast.feedUrl)
+                            Surface(
+                                onClick = {
+                                    subtleHaptic()
+                                    vm.loadDiscoverPodcastEpisodes(podcast)
+                                },
+                                shape = RoundedCornerShape(18.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                tonalElevation = 2.dp,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(
+                                    modifier = Modifier.padding(8.dp),
+                                    horizontalAlignment = Alignment.Start
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .aspectRatio(1f)
+                                            .clip(RoundedCornerShape(14.dp))
+                                            .background(MaterialTheme.colorScheme.surfaceVariant)
+                                    ) {
+                                        AsyncImage(
+                                            model = podcast.artworkUrl,
+                                            contentDescription = podcast.title,
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                        if (isSubscribed) {
+                                            Surface(
+                                                shape = CircleShape,
+                                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.9f),
+                                                modifier = Modifier
+                                                    .align(Alignment.TopEnd)
+                                                    .padding(6.dp)
+                                                    .size(24.dp)
+                                            ) {
+                                                Box(contentAlignment = Alignment.Center) {
+                                                    Icon(
+                                                        Icons.Default.Star,
+                                                        contentDescription = "Subscribed",
+                                                        tint = MaterialTheme.colorScheme.primary,
+                                                        modifier = Modifier.size(14.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Spacer(Modifier.height(6.dp))
+                                    Text(
+                                        text = podcast.title,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = podcast.author,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5184,8 +9104,9 @@ fun ExpressivePlayerScreen(
     val episode = vm.currentEpisode
     val podcast = vm.currentPodcast
     val context = LocalContext.current
+    val subtleHaptic = rememberSubtleHaptic()
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Player, 1 = Chapters, 2 = Notes
+    val selectedTab = vm.nowPlayingTabIndex // 0 = Player, 1 = Chapters, 2 = Notes
 
     // Expressive Spring Animation for Play/Pause Pill
     val playCorner by animateDpAsState(
@@ -5210,40 +9131,23 @@ fun ExpressivePlayerScreen(
     val playerConfig = LocalConfiguration.current
     val playerScreenWidth = playerConfig.screenWidthDp
     val playerScreenHeight = playerConfig.screenHeightDp
-
-    val artworkSize = when {
-        playerScreenHeight < 680 || playerScreenWidth < 340 -> 190.dp
-        playerScreenHeight < 740 || playerScreenWidth < 370 -> 220.dp
-        else -> 260.dp
-    }
-
-    val buttonSpacing = when {
-        playerScreenWidth < 340 -> 8.dp
-        playerScreenWidth < 380 -> 12.dp
-        else -> 20.dp
-    }
-
-    val skipBtnSize = when {
-        playerScreenWidth < 340 -> 58.dp
-        playerScreenWidth < 380 -> 64.dp
-        else -> 72.dp
-    }
-
-    val dynamicPlayWidth = when {
-        playerScreenWidth < 340 -> if (vm.isPlaying) 100.dp else 80.dp
-        playerScreenWidth < 380 -> if (vm.isPlaying) 112.dp else 88.dp
-        else -> playWidth
-    }
+    val isCompactHeight = playerScreenHeight < 860
 
     val playerHorizPadding = if (playerScreenWidth < 360) 12.dp else 20.dp
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(start = playerHorizPadding, end = playerHorizPadding, top = 8.dp, bottom = 12.dp),
+            .padding(
+                start = playerHorizPadding,
+                end = playerHorizPadding,
+                top = if (isCompactHeight) 4.dp else 8.dp,
+                bottom = if (isCompactHeight) 4.dp else 8.dp
+            ),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Expressive Top Tab Navigation: Player vs Chapters vs Notes (Slimmed)
+        val tabBarHeight = if (isCompactHeight) 38.dp else 44.dp
         TabRow(
             selectedTabIndex = selectedTab,
             containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
@@ -5254,13 +9158,16 @@ fun ExpressivePlayerScreen(
         ) {
             Tab(
                 selected = selectedTab == 0,
-                onClick = { selectedTab = 0 },
-                modifier = Modifier.height(44.dp)
+                onClick = {
+                    subtleHaptic()
+                    vm.nowPlayingTabIndex = 0
+                },
+                modifier = Modifier.height(tabBarHeight)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
                 ) {
                     Icon(Icons.Default.GraphicEq, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
@@ -5273,13 +9180,16 @@ fun ExpressivePlayerScreen(
             }
             Tab(
                 selected = selectedTab == 1,
-                onClick = { selectedTab = 1 },
-                modifier = Modifier.height(44.dp)
+                onClick = {
+                    subtleHaptic()
+                    vm.nowPlayingTabIndex = 1
+                },
+                modifier = Modifier.height(tabBarHeight)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
                 ) {
                     Icon(Icons.Default.Bookmarks, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
@@ -5293,13 +9203,16 @@ fun ExpressivePlayerScreen(
             }
             Tab(
                 selected = selectedTab == 2,
-                onClick = { selectedTab = 2 },
-                modifier = Modifier.height(44.dp)
+                onClick = {
+                    subtleHaptic()
+                    vm.nowPlayingTabIndex = 2
+                },
+                modifier = Modifier.height(tabBarHeight)
             ) {
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center,
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
                 ) {
                     Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
@@ -5312,329 +9225,601 @@ fun ExpressivePlayerScreen(
             }
         }
 
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.height(if (isCompactHeight) 6.dp else 10.dp))
 
         if (selectedTab == 0) {
             // ================= PLAYER TAB =================
-            Column(
+            BoxWithConstraints(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState()),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .fillMaxWidth()
+                    .weight(1f)
             ) {
-                // Expressive Squircle Artwork Container
-                Surface(
-                    shape = RoundedCornerShape(36.dp),
-                    tonalElevation = 10.dp,
-                    shadowElevation = 6.dp,
-                    modifier = Modifier.size(artworkSize)
+                val availH = maxHeight
+                val availW = maxWidth
+                val hasChapters = vm.currentChapters.isNotEmpty() && vm.currentChapter != null
+
+                // Dynamically compute component sizes from exact available height so all controls fit without scrolling
+                val reservedForControlsAndText = if (hasChapters) 325.dp else 290.dp
+                val computedArtSize = (availH - reservedForControlsAndText).coerceIn(88.dp, 240.dp)
+                val artworkSize = minOf(computedArtSize, availW * 0.65f)
+
+                val isTight = availH < 560.dp || availW < 370.dp
+                val isVeryTight = availH < 490.dp || availW < 340.dp
+
+                val skipBtnSize = when {
+                    isVeryTight -> 52.dp
+                    isTight -> 58.dp
+                    else -> 66.dp
+                }
+
+                val playBtnHeight = when {
+                    isVeryTight -> 56.dp
+                    isTight -> 62.dp
+                    else -> 70.dp
+                }
+
+                val dynamicPlayWidth = when {
+                    isVeryTight -> if (vm.isPlaying) 96.dp else 78.dp
+                    isTight -> if (vm.isPlaying) 110.dp else 86.dp
+                    else -> playWidth
+                }
+
+                val buttonSpacing = when {
+                    availW < 340.dp -> 10.dp
+                    availW < 380.dp -> 14.dp
+                    else -> 20.dp
+                }
+
+                Column(
+                    modifier = Modifier.fillMaxSize(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.SpaceEvenly
                 ) {
-                    if (podcast != null) {
-                        AsyncImage(
-                            model = podcast.artworkUrl,
-                            contentDescription = podcast.title,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                    // Expressive Squircle Artwork Container
+                    Surface(
+                        shape = RoundedCornerShape(if (artworkSize < 160.dp) 22.dp else 30.dp),
+                        tonalElevation = 10.dp,
+                        shadowElevation = 6.dp,
+                        modifier = Modifier.size(artworkSize)
+                    ) {
+                        if (podcast != null) {
+                            AsyncImage(
+                                model = podcast.artworkUrl,
+                                contentDescription = podcast.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    Icons.Default.Podcasts,
+                                    contentDescription = null,
+                                    modifier = Modifier.size((artworkSize * 0.35f).coerceAtLeast(40.dp)),
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                        }
+                    }
+
+                    // Episode Title & Podcast Subtitle
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 6.dp)
+                    ) {
+                        Text(
+                            text = episode?.title ?: "Select an Episode",
+                            style = if (isTight) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.ExtraBold,
+                            textAlign = TextAlign.Center,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
                         )
-                    } else {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(MaterialTheme.colorScheme.surfaceContainerHighest),
-                            contentAlignment = Alignment.Center
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = podcast?.title ?: "Use Discover to search podcasts",
+                            style = if (isTight) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            textAlign = TextAlign.Center,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+
+                        val downloadedEpisodes by vm.downloadedEpisodes.collectAsState()
+                        val activeDownloads by vm.activeDownloads.collectAsState()
+                        val isDownloaded = episode?.let { ep -> downloadedEpisodes.any { it.audioUrl == ep.audioUrl } } ?: false
+                        val isDownloading = episode?.let { ep -> activeDownloads.containsKey(ep.audioUrl) } ?: false
+                        val downloadProgress = episode?.let { ep -> activeDownloads[ep.audioUrl] }
+
+                        Spacer(Modifier.height(if (isTight) 4.dp else 6.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Icon(
-                                Icons.Default.Podcasts,
-                                contentDescription = null,
-                                modifier = Modifier.size(80.dp),
-                                tint = MaterialTheme.colorScheme.primary
+                            if (podcast != null && LocalAudioManager.isLocalPodcast(podcast)) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.AudioFile,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        val size = episode?.let { vm.getFormattedDownloadSize(it.audioUrl) }
+                                        Spacer(Modifier.width(5.dp))
+                                        Text(
+                                            if (size != null) "Local File • $size" else "Local File",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
+                                }
+                            } else if (isDownloaded) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    modifier = Modifier.clickable {
+                                        subtleHaptic()
+                                        episode?.let { vm.deleteDownload(it.audioUrl) }
+                                    }
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            Icons.Default.OfflinePin,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        val size = episode?.let { vm.getFormattedDownloadSize(it.audioUrl) }
+                                        Spacer(Modifier.width(5.dp))
+                                        Text(
+                                            if (size != null) "Downloaded • $size" else "Downloaded",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                                        )
+                                    }
+                                }
+                            } else if (isDownloading) {
+                                AssistChip(
+                                    onClick = {
+                                        subtleHaptic()
+                                        episode?.let { vm.cancelDownload(it.audioUrl) }
+                                    },
+                                    label = {
+                                        val pct = ((downloadProgress ?: 0f) * 100).toInt()
+                                        Text("Downloading $pct%")
+                                    },
+                                    leadingIcon = {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(15.dp),
+                                            strokeWidth = 2.dp
+                                        )
+                                    },
+                                    shape = RoundedCornerShape(16.dp),
+                                    modifier = Modifier.height(30.dp)
+                                )
+                            } else if (episode != null && podcast != null) {
+                                AssistChip(
+                                    onClick = {
+                                        subtleHaptic()
+                                        vm.downloadEpisode(podcast, episode)
+                                    },
+                                    label = { Text("Download") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    },
+                                    shape = RoundedCornerShape(16.dp),
+                                    modifier = Modifier.height(30.dp)
+                                )
+                            }
+
+                            val autoArchiveEnabled by vm.autoArchiveEnabled.collectAsState()
+                            if (episode != null) {
+                                val keepUnarchivedEpisodes by vm.keepUnarchivedEpisodes.collectAsState()
+                                val isPinned = keepUnarchivedEpisodes.contains(episode.audioUrl)
+                                if (autoArchiveEnabled || isPinned) {
+                                    AssistChip(
+                                        onClick = {
+                                            subtleHaptic()
+                                            val willPin = !isPinned
+                                            vm.toggleKeepUnarchived(episode)
+                                            Toast.makeText(
+                                                context,
+                                                if (willPin) "Episode Pinned (will stay unarchived)" else "Episode Unpinned (auto-archive restored)",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        },
+                                        label = { Text(if (isPinned) "Episode Pinned" else "Episode Unpinned") },
+                                        leadingIcon = {
+                                            Icon(
+                                                if (isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                                                contentDescription = if (isPinned) "Episode Pinned" else "Episode Unpinned",
+                                                modifier = Modifier.size(16.dp),
+                                                tint = if (isPinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        },
+                                        shape = RoundedCornerShape(16.dp),
+                                        modifier = Modifier.height(30.dp)
+                                    )
+                                } else {
+                                    val archivedEpisodes by vm.archivedEpisodes.collectAsState()
+                                    val isArchived = archivedEpisodes.contains(episode.audioUrl)
+                                    AssistChip(
+                                        onClick = {
+                                            subtleHaptic()
+                                            vm.toggleArchive(episode, !isArchived)
+                                        },
+                                        label = { Text(if (isArchived) "Archived" else "Archive") },
+                                        leadingIcon = {
+                                            Icon(
+                                                if (isArchived) Icons.Default.Unarchive else Icons.Default.Archive,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        },
+                                        shape = RoundedCornerShape(16.dp),
+                                        modifier = Modifier.height(30.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Current Chapter Pill (Clicking jumps directly to Chapters section)
+                    if (vm.currentChapters.isNotEmpty()) {
+                        val activeCh = vm.currentChapter
+                        if (activeCh != null) {
+                            Surface(
+                                shape = RoundedCornerShape(18.dp),
+                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+                                modifier = Modifier
+                                    .clickable {
+                                        subtleHaptic()
+                                        vm.nowPlayingTabIndex = 1
+                                    }
+                                    .padding(horizontal = 4.dp)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Bookmarks,
+                                        contentDescription = "Chapter",
+                                        modifier = Modifier.size(15.dp),
+                                        tint = MaterialTheme.colorScheme.primary
+                                    )
+                                    Text(
+                                        text = "Ch. ${vm.currentChapterIndex + 1}: ${activeCh.title}",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.ArrowForwardIos,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(10.dp),
+                                        tint = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // Progress Scrubber
+                    val showRemainingTime by vm.showRemainingTime.collectAsState()
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        val progress = (vm.currentPosition.toFloat() / vm.duration.toFloat()).coerceIn(0f, 1f)
+                        Slider(
+                            value = progress,
+                            onValueChange = { vm.seekTo(it) },
+                            onValueChangeFinished = { subtleHaptic() },
+                            modifier = Modifier.height(if (isTight) 28.dp else 36.dp)
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(formatTime(vm.currentPosition), style = MaterialTheme.typography.labelMedium)
+                            val remainingMs = (vm.duration - vm.currentPosition).coerceAtLeast(0L)
+                            val rightTimeText = if (showRemainingTime) "-${formatTime(remainingMs)}" else formatTime(vm.duration)
+                            Text(
+                                text = rightTimeText,
+                                style = MaterialTheme.typography.labelMedium,
+                                modifier = Modifier.clickable {
+                                    subtleHaptic()
+                                    vm.setShowRemainingTime(!showRemainingTime)
+                                }
                             )
                         }
                     }
-                }
 
-                // Episode Title & Podcast Subtitle (no truncation!)
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp)
-                ) {
-                    Text(
-                        text = episode?.title ?: "Select an Episode",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.ExtraBold,
-                        textAlign = TextAlign.Center
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = podcast?.title ?: "Use Discover to search podcasts",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                        textAlign = TextAlign.Center
-                    )
+                    // Transport Controls
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(buttonSpacing)
+                    ) {
+                        FilledTonalButton(
+                            onClick = {
+                                subtleHaptic()
+                                vm.skipRewind()
+                            },
+                            shape = CircleShape,
+                            modifier = Modifier.size(skipBtnSize),
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.Replay,
+                                    contentDescription = "Rewind",
+                                    modifier = Modifier.size(if (isTight) 20.dp else 24.dp)
+                                )
+                                Text(
+                                    "-${rewindSec}s",
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = if (isTight) 10.sp else 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        lineBreak = LineBreak.Heading,
+                                        hyphens = Hyphens.None
+                                    )
+                                )
+                            }
+                        }
 
-                    val downloadedEpisodes by vm.downloadedEpisodes.collectAsState()
-                    val activeDownloads by vm.activeDownloads.collectAsState()
-                    val isDownloaded = episode?.let { ep -> downloadedEpisodes.any { it.audioUrl == ep.audioUrl } } ?: false
-                    val isDownloading = episode?.let { ep -> activeDownloads.containsKey(ep.audioUrl) } ?: false
-                    val downloadProgress = episode?.let { ep -> activeDownloads[ep.audioUrl] }
+                        Button(
+                            onClick = {
+                                subtleHaptic()
+                                vm.togglePlayPause()
+                            },
+                            shape = RoundedCornerShape(playCorner),
+                            modifier = Modifier.size(width = dynamicPlayWidth, height = playBtnHeight),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = playColor,
+                                contentColor = playContentColor
+                            )
+                        ) {
+                            Icon(
+                                imageVector = if (vm.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = "Play/Pause",
+                                modifier = Modifier.size(if (isTight) 30.dp else 36.dp)
+                            )
+                        }
 
-                    Spacer(Modifier.height(8.dp))
+                        FilledTonalButton(
+                            onClick = {
+                                subtleHaptic()
+                                vm.skipForward()
+                            },
+                            shape = CircleShape,
+                            modifier = Modifier.size(skipBtnSize),
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Icon(
+                                    Icons.Default.Forward30,
+                                    contentDescription = "Fast Forward",
+                                    modifier = Modifier.size(if (isTight) 20.dp else 24.dp)
+                                )
+                                Text(
+                                    "+${forwardSec}s",
+                                    maxLines = 1,
+                                    softWrap = false,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontSize = if (isTight) 10.sp else 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        lineBreak = LineBreak.Heading,
+                                        hyphens = Hyphens.None
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    // Quick Action Chips: Volume Boost & Playback Speed
+                    val volumeBoost by vm.volumeBoostEnabled.collectAsState()
+                    val currentSpeed = vm.currentPlaybackSpeed
+                    val isCustomSpeed = kotlin.math.abs(currentSpeed - 1.0f) >= 0.05f
+                    var showSpeedPopup by remember { mutableStateOf(false) }
+
                     Row(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        if (isDownloaded) {
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer,
-                                modifier = Modifier.clickable {
-                                    episode?.let { vm.deleteDownload(it.audioUrl) }
-                                }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
+                        FilterChip(
+                            selected = volumeBoost,
+                            onClick = {
+                                subtleHaptic()
+                                vm.setVolumeBoostEnabled(!volumeBoost)
+                            },
+                            label = { Text("Volume Boost") },
+                            leadingIcon = {
+                                Icon(
+                                    if (volumeBoost) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeDown,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            shape = RoundedCornerShape(16.dp),
+                            modifier = Modifier.height(30.dp)
+                        )
+
+                        Box {
+                            FilterChip(
+                                selected = isCustomSpeed || showSpeedPopup,
+                                onClick = {
+                                    subtleHaptic()
+                                    showSpeedPopup = !showSpeedPopup
+                                },
+                                label = { Text("Speed • ${PlaybackSpeedManager.formatSpeed(currentSpeed)}") },
+                                leadingIcon = {
                                     Icon(
-                                        Icons.Default.OfflinePin,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                                        Icons.Default.Speed,
+                                        contentDescription = "Playback Speed",
                                         modifier = Modifier.size(16.dp)
                                     )
-                                    val size = episode?.let { vm.getFormattedDownloadSize(it.audioUrl) }
-                                    Spacer(Modifier.width(6.dp))
-                                    Text(
-                                        if (size != null) "Downloaded • $size" else "Downloaded",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onPrimaryContainer
-                                    )
+                                },
+                                shape = RoundedCornerShape(16.dp),
+                                modifier = Modifier.height(30.dp)
+                            )
+
+                            if (showSpeedPopup) {
+                                val density = LocalDensity.current
+                                val verticalMarginPx = with(density) { 8.dp.roundToPx() }
+                                val horizontalMarginPx = with(density) { 12.dp.roundToPx() }
+                                val popupPositionProvider = remember(verticalMarginPx, horizontalMarginPx) {
+                                    object : PopupPositionProvider {
+                                        override fun calculatePosition(
+                                            anchorBounds: IntRect,
+                                            windowSize: IntSize,
+                                            layoutDirection: LayoutDirection,
+                                            popupContentSize: IntSize
+                                        ): IntOffset {
+                                            val x = (anchorBounds.left + (anchorBounds.width - popupContentSize.width) / 2)
+                                                .coerceIn(
+                                                    horizontalMarginPx,
+                                                    (windowSize.width - popupContentSize.width - horizontalMarginPx).coerceAtLeast(horizontalMarginPx)
+                                                )
+                                            val aboveY = anchorBounds.top - popupContentSize.height - verticalMarginPx
+                                            val y = if (aboveY >= verticalMarginPx) {
+                                                aboveY
+                                            } else {
+                                                anchorBounds.bottom + verticalMarginPx
+                                            }
+                                            return IntOffset(x, y)
+                                        }
+                                    }
+                                }
+
+                                Popup(
+                                    popupPositionProvider = popupPositionProvider,
+                                    onDismissRequest = { showSpeedPopup = false },
+                                    properties = PopupProperties(focusable = true)
+                                ) {
+                                    Surface(
+                                        shape = RoundedCornerShape(20.dp),
+                                        color = MaterialTheme.colorScheme.surfaceContainerHighest,
+                                        tonalElevation = 8.dp,
+                                        shadowElevation = 8.dp,
+                                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+                                        modifier = Modifier.width(248.dp)
+                                    ) {
+                                        Column(
+                                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                                        ) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Row(
+                                                    verticalAlignment = Alignment.CenterVertically,
+                                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                                ) {
+                                                    Icon(
+                                                        Icons.Default.Speed,
+                                                        contentDescription = null,
+                                                        modifier = Modifier.size(15.dp),
+                                                        tint = MaterialTheme.colorScheme.primary
+                                                    )
+                                                    Text(
+                                                        text = PlaybackSpeedManager.formatSpeed(currentSpeed),
+                                                        style = MaterialTheme.typography.titleSmall,
+                                                        fontWeight = FontWeight.ExtraBold,
+                                                        color = MaterialTheme.colorScheme.primary
+                                                    )
+                                                }
+                                                Surface(
+                                                    shape = RoundedCornerShape(10.dp),
+                                                    color = if (isCustomSpeed) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainer,
+                                                    modifier = Modifier.clickable(enabled = isCustomSpeed) {
+                                                        subtleHaptic()
+                                                        vm.setPlaybackSpeedForCurrentPodcast(1.0f)
+                                                    }
+                                                ) {
+                                                    Text(
+                                                        text = "1.0x",
+                                                        style = MaterialTheme.typography.labelSmall,
+                                                        fontWeight = FontWeight.Bold,
+                                                        color = if (isCustomSpeed) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                                    )
+                                                }
+                                            }
+                                            var lastSpeedStep by remember { mutableIntStateOf(kotlin.math.round(currentSpeed * 20f).toInt()) }
+                                            Slider(
+                                                value = currentSpeed,
+                                                onValueChange = { raw ->
+                                                    val step = kotlin.math.round(raw * 20f).toInt()
+                                                    if (step != lastSpeedStep) {
+                                                        lastSpeedStep = step
+                                                        subtleHaptic()
+                                                    }
+                                                    vm.setPlaybackSpeedForCurrentPodcast(raw)
+                                                },
+                                                valueRange = PlaybackSpeedManager.MIN_SPEED..PlaybackSpeedManager.MAX_SPEED,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .height(28.dp)
+                                            )
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Text(
+                                                    text = "0.5x",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                                Text(
+                                                    text = if (podcast != null) podcast.title else "Default",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    textAlign = TextAlign.Center,
+                                                    modifier = Modifier
+                                                        .weight(1f)
+                                                        .padding(horizontal = 6.dp)
+                                                )
+                                                Text(
+                                                    text = "5.0x",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontSize = 10.sp,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                                )
+                                            }
+                                        }
+                                    }
                                 }
                             }
-                        } else if (isDownloading) {
-                            AssistChip(
-                                onClick = { episode?.let { vm.cancelDownload(it.audioUrl) } },
-                                label = {
-                                    val pct = ((downloadProgress ?: 0f) * 100).toInt()
-                                    Text("Downloading $pct%")
-                                },
-                                leadingIcon = {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp
-                                    )
-                                },
-                                shape = RoundedCornerShape(16.dp)
-                            )
-                        } else if (episode != null && podcast != null) {
-                            AssistChip(
-                                onClick = { vm.downloadEpisode(podcast, episode) },
-                                label = { Text("Download") },
-                                leadingIcon = {
-                                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                                },
-                                shape = RoundedCornerShape(16.dp)
-                            )
-                        }
-
-                        val autoArchiveEnabled by vm.autoArchiveEnabled.collectAsState()
-                        if (episode != null) {
-                            val keepUnarchivedEpisodes by vm.keepUnarchivedEpisodes.collectAsState()
-                            val isPinned = keepUnarchivedEpisodes.contains(episode.audioUrl)
-                            if (autoArchiveEnabled || isPinned) {
-                                AssistChip(
-                                    onClick = {
-                                        val willPin = !isPinned
-                                        vm.toggleKeepUnarchived(episode)
-                                        Toast.makeText(
-                                            context,
-                                            if (willPin) "Episode Pinned (will stay unarchived)" else "Episode Unpinned (auto-archive restored)",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    },
-                                    label = { Text(if (isPinned) "Episode Pinned" else "Episode Unpinned") },
-                                    leadingIcon = {
-                                        Icon(
-                                            if (isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
-                                            contentDescription = if (isPinned) "Episode Pinned" else "Episode Unpinned",
-                                            modifier = Modifier.size(18.dp),
-                                            tint = if (isPinned) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    },
-                                    shape = RoundedCornerShape(16.dp)
-                                )
-                            } else {
-                                val archivedEpisodes by vm.archivedEpisodes.collectAsState()
-                                val isArchived = archivedEpisodes.contains(episode.audioUrl)
-                                AssistChip(
-                                    onClick = { vm.toggleArchive(episode, !isArchived) },
-                                    label = { Text(if (isArchived) "Archived" else "Archive") },
-                                    leadingIcon = {
-                                        Icon(
-                                            if (isArchived) Icons.Default.Unarchive else Icons.Default.Archive,
-                                            contentDescription = null,
-                                            modifier = Modifier.size(18.dp)
-                                        )
-                                    },
-                                    shape = RoundedCornerShape(16.dp)
-                                )
-                            }
                         }
                     }
                 }
-
-                // Current Chapter Pill (Clicking jumps directly to Chapters section)
-                if (vm.currentChapters.isNotEmpty()) {
-                    val activeCh = vm.currentChapter
-                    if (activeCh != null) {
-                        Surface(
-                            shape = RoundedCornerShape(18.dp),
-                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
-                            modifier = Modifier
-                                .clickable { selectedTab = 1 }
-                                .padding(horizontal = 4.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Bookmarks,
-                                    contentDescription = "Chapter",
-                                    modifier = Modifier.size(16.dp),
-                                    tint = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    text = "Ch. ${vm.currentChapterIndex + 1}: ${activeCh.title}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.ArrowForwardIos,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(10.dp),
-                                    tint = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.7f)
-                                )
-                            }
-                        }
-                    }
-                }
-
-                // Progress Scrubber
-                val showRemainingTime by vm.showRemainingTime.collectAsState()
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    val progress = (vm.currentPosition.toFloat() / vm.duration.toFloat()).coerceIn(0f, 1f)
-                    Slider(
-                        value = progress,
-                        onValueChange = { vm.seekTo(it) }
-                    )
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(formatTime(vm.currentPosition), style = MaterialTheme.typography.labelMedium)
-                        val remainingMs = (vm.duration - vm.currentPosition).coerceAtLeast(0L)
-                        val rightTimeText = if (showRemainingTime) "-${formatTime(remainingMs)}" else formatTime(vm.duration)
-                        Text(
-                            text = rightTimeText,
-                            style = MaterialTheme.typography.labelMedium,
-                            modifier = Modifier.clickable {
-                                vm.setShowRemainingTime(!showRemainingTime)
-                            }
-                        )
-                    }
-                }
-
-
-                // Transport Controls
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(buttonSpacing)
-                ) {
-                    FilledTonalButton(
-                        onClick = { vm.skipRewind() },
-                        shape = CircleShape,
-                        modifier = Modifier.size(skipBtnSize),
-                        contentPadding = PaddingValues(0.dp)
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.Replay, contentDescription = "Rewind")
-                            Text(
-                                "-${rewindSec}s",
-                                maxLines = 1,
-                                softWrap = false,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = if (playerScreenWidth < 360) 10.sp else 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    lineBreak = LineBreak.Heading,
-                                    hyphens = Hyphens.None
-                                )
-                            )
-                        }
-                    }
-
-                    Button(
-                        onClick = { vm.togglePlayPause() },
-                        shape = RoundedCornerShape(playCorner),
-                        modifier = Modifier.size(width = dynamicPlayWidth, height = if (playerScreenWidth < 360) 68.dp else 78.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = playColor,
-                            contentColor = playContentColor
-                        )
-                    ) {
-                        Icon(
-                            imageVector = if (vm.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Play/Pause",
-                            modifier = Modifier.size(if (playerScreenWidth < 360) 30.dp else 38.dp)
-                        )
-                    }
-
-                    FilledTonalButton(
-                        onClick = { vm.skipForward() },
-                        shape = CircleShape,
-                        modifier = Modifier.size(skipBtnSize),
-                        contentPadding = PaddingValues(0.dp)
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Icon(Icons.Default.Forward30, contentDescription = "Fast Forward")
-                            Text(
-                                "+${forwardSec}s",
-                                maxLines = 1,
-                                softWrap = false,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = if (playerScreenWidth < 360) 10.sp else 12.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    lineBreak = LineBreak.Heading,
-                                    hyphens = Hyphens.None
-                                )
-                            )
-                        }
-                    }
-                }
-
-                // Quick Action Chip: Volume Boost
-                val volumeBoost by vm.volumeBoostEnabled.collectAsState()
-                FilterChip(
-                    selected = volumeBoost,
-                    onClick = { vm.setVolumeBoostEnabled(!volumeBoost) },
-                    label = { Text("Volume Boost") },
-                    leadingIcon = {
-                        Icon(
-                            if (volumeBoost) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeDown,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    },
-                    shape = RoundedCornerShape(16.dp)
-                )
-                Spacer(Modifier.height(16.dp))
             }
         } else if (selectedTab == 1) {
             // ================= CHAPTERS TAB =================
@@ -5679,13 +9864,19 @@ fun ExpressivePlayerScreen(
                             if (vm.currentChapters.isNotEmpty()) {
                                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                     IconButton(
-                                        onClick = { vm.skipToPreviousChapter() },
+                                        onClick = {
+                                            subtleHaptic()
+                                            vm.skipToPreviousChapter()
+                                        },
                                         enabled = vm.currentChapterIndex > 0
                                     ) {
                                         Icon(Icons.Default.SkipPrevious, contentDescription = "Previous Chapter")
                                     }
                                     IconButton(
-                                        onClick = { vm.skipToNextChapter() },
+                                        onClick = {
+                                            subtleHaptic()
+                                            vm.skipToNextChapter()
+                                        },
                                         enabled = vm.currentChapterIndex < vm.currentChapters.size - 1
                                     ) {
                                         Icon(Icons.Default.SkipNext, contentDescription = "Next Chapter")
@@ -5798,6 +9989,7 @@ fun ExpressivePlayerScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
+                                        subtleHaptic()
                                         vm.seekToChapter(chapter)
                                     }
                             ) {
@@ -5885,6 +10077,7 @@ fun ExpressivePlayerScreen(
                                     if (!chapter.url.isNullOrBlank()) {
                                         IconButton(
                                             onClick = {
+                                                subtleHaptic()
                                                 SecurityUtils.openSafeUrl(context, chapter.url)
                                             },
                                             modifier = Modifier.size(32.dp)
@@ -5947,7 +10140,7 @@ fun ExpressivePlayerScreen(
                     Surface(
                         shape = RoundedCornerShape(24.dp),
                         color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.7f),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)
                     ) {
                         FormattedEpisodeNotes(
                             notesText = rawDescription,
@@ -5987,52 +10180,6 @@ fun ExpressivePlayerScreen(
                         }
                     }
                 }
-
-                // Mini Transport Bar at bottom of Notes
-                Surface(
-                    shape = RoundedCornerShape(20.dp),
-                    color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.8f),
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 16.dp)
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        val progress = (vm.currentPosition.toFloat() / vm.duration.toFloat()).coerceIn(0f, 1f)
-                        Slider(
-                            value = progress,
-                            onValueChange = { vm.seekTo(it) }
-                        )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Text(formatTime(vm.currentPosition), style = MaterialTheme.typography.labelSmall)
-                            Text(formatTime(vm.duration), style = MaterialTheme.typography.labelSmall)
-                        }
-                        Spacer(Modifier.height(6.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            IconButton(onClick = { vm.skipRewind() }) {
-                                Icon(Icons.Default.Replay, contentDescription = "Rewind")
-                            }
-                            Spacer(Modifier.width(16.dp))
-                            FilledIconButton(
-                                onClick = { vm.togglePlayPause() },
-                                modifier = Modifier.size(48.dp)
-                            ) {
-                                Icon(
-                                    if (vm.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                                    contentDescription = "Play/Pause"
-                                )
-                            }
-                            Spacer(Modifier.width(16.dp))
-                            IconButton(onClick = { vm.skipForward() }) {
-                                Icon(Icons.Default.Forward30, contentDescription = "Forward")
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -6049,6 +10196,7 @@ fun SkipPresetBottomSheet(
     val presetOptions = listOf(5, 10, 15, 30, 45, 60)
     var selectedRewind by remember { mutableIntStateOf(currentRewind) }
     var selectedForward by remember { mutableIntStateOf(currentForward) }
+    val subtleHaptic = rememberSubtleHaptic()
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -6070,6 +10218,7 @@ fun SkipPresetBottomSheet(
                     FilterChip(
                         selected = selectedRewind == sec,
                         onClick = {
+                            subtleHaptic()
                             selectedRewind = sec
                             onSave(selectedRewind, selectedForward)
                         },
@@ -6087,6 +10236,7 @@ fun SkipPresetBottomSheet(
                     FilterChip(
                         selected = selectedForward == sec,
                         onClick = {
+                            subtleHaptic()
                             selectedForward = sec
                             onSave(selectedRewind, selectedForward)
                         },
@@ -6120,6 +10270,7 @@ fun NotificationSettingsBottomSheet(
 ) {
     val context = LocalContext.current
     val notificationsEnabled by vm.notificationsEnabled.collectAsState()
+    val subtleHaptic = rememberSubtleHaptic()
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -6186,6 +10337,7 @@ fun NotificationSettingsBottomSheet(
                     Switch(
                         checked = notificationsEnabled,
                         onCheckedChange = { checked ->
+                            subtleHaptic()
                             if (checked) {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED) {
@@ -6240,6 +10392,7 @@ fun NotificationSettingsBottomSheet(
                         Spacer(Modifier.height(12.dp))
                         FilledTonalButton(
                             onClick = {
+                                subtleHaptic()
                                 vm.triggerEpisodeSync()
                                 Toast.makeText(context, "Checking subscriptions for new episodes now...", Toast.LENGTH_SHORT).show()
                             },
@@ -6286,13 +10439,15 @@ fun NotificationSettingsBottomSheet(
 fun SubscriptionsScreen(
     vm: PodcastViewModel,
     onEpisodeSelected: (Podcast, Episode) -> Unit,
-    onOpenNotificationSettings: () -> Unit = {}
+    onOpenNotificationSettings: () -> Unit = {},
+    onOpenLocalAudioSettings: () -> Unit = {}
 ) {
     val subscriptions by vm.subscriptions.collectAsState()
     var orderedSubscriptions by remember(subscriptions) { mutableStateOf(subscriptions) }
     var isDraggingGrid by remember { mutableStateOf(false) }
     var isDraggingList by remember { mutableStateOf(false) }
     val haptic = LocalHapticFeedback.current
+    val subtleHaptic = rememberSubtleHaptic()
     val coroutineScope = rememberCoroutineScope()
 
     LaunchedEffect(subscriptions) {
@@ -6304,48 +10459,96 @@ fun SubscriptionsScreen(
     val displaySubscriptions = if (orderedSubscriptions.isEmpty() && subscriptions.isNotEmpty()) subscriptions else orderedSubscriptions
 
     val isGridView by vm.isGridView.collectAsState()
+    val authenticatedFeeds by vm.authenticatedFeedUrls.collectAsState()
     val archivedEpisodes by vm.archivedEpisodes.collectAsState()
     val playedEpisodes by vm.playedEpisodes.collectAsState()
     val downloadedEpisodes by vm.downloadedEpisodes.collectAsState()
+    val localAudioFiles by vm.localAudioFiles.collectAsState()
     val activeDownloads by vm.activeDownloads.collectAsState()
     val keepUnarchivedEpisodes by vm.keepUnarchivedEpisodes.collectAsState()
     val autoArchiveEnabled by vm.autoArchiveEnabled.collectAsState()
+    val showUnplayedBadge by vm.showUnplayedBadge.collectAsState()
+    val showDownloadedBadge by vm.showDownloadedBadge.collectAsState()
+    val subEpisodesMap by vm.subscriptionEpisodesMap.collectAsState()
     val context = LocalContext.current
-    
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
-        if (vm.subscriptionSelectedPodcast == null) {
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    "Subscriptions",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold
-                )
-                IconButton(onClick = { vm.updateGridView(!isGridView) }) {
-                    Icon(if (isGridView) Icons.Default.Menu else Icons.Default.GridView, contentDescription = "Toggle View")
-                }
+
+    LaunchedEffect(displaySubscriptions) {
+        if (displaySubscriptions.isNotEmpty()) {
+            vm.refreshSubscriptionFeedsInBackground(displaySubscriptions)
+        }
+    }
+
+    val downloadedAudioSet = remember(downloadedEpisodes) { downloadedEpisodes.map { it.audioUrl }.toSet() }
+
+    fun getSubscriptionBadgeCounts(podcast: Podcast): Pair<Int, Int> {
+        if (LocalAudioManager.isLocalPodcast(podcast)) {
+            val unplayedCount = localAudioFiles.count { item ->
+                item.audioUrl.isNotBlank() && !playedEpisodes.contains(item.audioUrl) && !archivedEpisodes.contains(item.audioUrl)
+            }
+            val downloadedCount = localAudioFiles.count { item ->
+                item.audioUrl.isNotBlank() && !playedEpisodes.contains(item.audioUrl) && !archivedEpisodes.contains(item.audioUrl)
+            }
+            return Pair(unplayedCount, downloadedCount)
+        }
+        val normKey = FeedCredentialsManager.normalizeUrlKey(podcast.feedUrl)
+        val cachedFeed = NetworkModule.getCachedFeed(podcast.feedUrl)
+        val episodeUrls = when {
+            cachedFeed != null && cachedFeed.episodes.isNotEmpty() -> cachedFeed.episodes.map { it.audioUrl }
+            subEpisodesMap[normKey] != null -> subEpisodesMap[normKey]!!
+            subEpisodesMap[podcast.feedUrl.trim()] != null -> subEpisodesMap[podcast.feedUrl.trim()]!!
+            else -> emptyList()
+        }
+        val unplayedCount = episodeUrls.count { url ->
+            url.isNotBlank() && !playedEpisodes.contains(url) && !archivedEpisodes.contains(url)
+        }
+        val downloadedCount = if (episodeUrls.isNotEmpty()) {
+            val epSet = episodeUrls.toSet()
+            downloadedEpisodes.count { dl ->
+                !playedEpisodes.contains(dl.audioUrl) &&
+                    !archivedEpisodes.contains(dl.audioUrl) &&
+                    (epSet.contains(dl.audioUrl) ||
+                        (dl.feedUrl.isNotBlank() && FeedCredentialsManager.normalizeUrlKey(dl.feedUrl) == normKey) ||
+                        (dl.feedUrl.isBlank() && dl.podcastTitle.equals(podcast.title, ignoreCase = true)))
+            }
+        } else {
+            downloadedEpisodes.count { dl ->
+                !playedEpisodes.contains(dl.audioUrl) &&
+                    !archivedEpisodes.contains(dl.audioUrl) &&
+                    ((dl.feedUrl.isNotBlank() && FeedCredentialsManager.normalizeUrlKey(dl.feedUrl) == normKey) ||
+                        (dl.feedUrl.isBlank() && dl.podcastTitle.equals(podcast.title, ignoreCase = true)))
             }
         }
-        
+        return Pair(unplayedCount, downloadedCount)
+    }
+    
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         if (vm.subscriptionSelectedPodcast != null) {
             PodcastDetailView(
                 podcast = vm.subscriptionSelectedPodcast!!,
                 episodes = vm.subscriptionEpisodes,
                 vm = vm,
                 onBack = { vm.subscriptionSelectedPodcast = null },
-                onEpisodeSelected = onEpisodeSelected
+                onEpisodeSelected = onEpisodeSelected,
+                onOpenLocalAudioSettings = onOpenLocalAudioSettings
             )
         } else if (displaySubscriptions.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No subscriptions yet. Go to Discover to add some!", textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    modifier = Modifier.padding(horizontal = 24.dp)
+                ) {
+                    Text(
+                        "No subscriptions yet. Go to Discover to search or add a custom RSS feed!",
+                        textAlign = TextAlign.Center
+                    )
+                }
             }
         } else {
             if (isGridView) {
                 val gridState = rememberLazyGridState()
                 val reorderableLazyGridState = rememberReorderableLazyGridState(gridState) { from, to ->
+                    subtleHaptic()
                     orderedSubscriptions = orderedSubscriptions.toMutableList().apply {
                         add(to.index, removeAt(from.index))
                     }
@@ -6366,9 +10569,14 @@ fun SubscriptionsScreen(
                             val interactionSource = remember { MutableInteractionSource() }
                             val elevation by animateDpAsState(if (isDragging) 16.dp else 0.dp)
                             val scale by animateFloatAsState(if (isDragging) 1.08f else 1f)
+                            val isAuthenticated = authenticatedFeeds.contains(FeedCredentialsManager.normalizeUrlKey(podcast.feedUrl))
+                            val (unplayedCount, downloadedCount) = getSubscriptionBadgeCounts(podcast)
 
                             Surface(
-                                onClick = { vm.loadSubscriptionPodcastEpisodes(podcast) },
+                                onClick = {
+                                    subtleHaptic()
+                                    vm.loadSubscriptionPodcastEpisodes(podcast)
+                                },
                                 shape = RoundedCornerShape(16.dp),
                                 color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = if (isDragging) 0.95f else 0.6f),
                                 shadowElevation = elevation,
@@ -6392,12 +10600,81 @@ fun SubscriptionsScreen(
                                         }
                                     )
                             ) {
-                                AsyncImage(
-                                    model = podcast.artworkUrl,
-                                    contentDescription = podcast.title,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    AsyncImage(
+                                        model = podcast.artworkUrl,
+                                        contentDescription = podcast.title,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                    if (LocalAudioManager.isLocalPodcast(podcast)) {
+                                        Surface(
+                                            shape = RoundedCornerShape(topStart = 10.dp, topEnd = 10.dp),
+                                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                                            modifier = Modifier
+                                                .align(Alignment.BottomCenter)
+                                                .fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                text = podcast.title,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                textAlign = TextAlign.Center,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp)
+                                            )
+                                        }
+                                    }
+                                    if (isAuthenticated) {
+                                        Surface(
+                                            shape = CircleShape,
+                                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.85f),
+                                            modifier = Modifier
+                                                .align(Alignment.TopStart)
+                                                .padding(6.dp)
+                                                .size(22.dp)
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Icon(
+                                                    Icons.Default.Lock,
+                                                    contentDescription = "Authenticated Feed",
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(13.dp)
+                                                )
+                                            }
+                                        }
+                                    }
+                                    val displayUnplayed = showUnplayedBadge && unplayedCount > 0
+                                    val displayDownloaded = showDownloadedBadge && downloadedCount > 0
+                                    if (displayUnplayed || displayDownloaded) {
+                                        Row(
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .padding(6.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            if (displayDownloaded) {
+                                                SubscriptionEpisodeBadge(
+                                                    count = downloadedCount,
+                                                    containerColor = MaterialTheme.colorScheme.tertiary,
+                                                    contentColor = MaterialTheme.colorScheme.onTertiary,
+                                                    compact = true
+                                                )
+                                            }
+                                            if (displayUnplayed) {
+                                                SubscriptionEpisodeBadge(
+                                                    count = unplayedCount,
+                                                    containerColor = MaterialTheme.colorScheme.primary,
+                                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                                    compact = true
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -6405,6 +10682,7 @@ fun SubscriptionsScreen(
             } else {
                 val listState = rememberLazyListState()
                 val reorderableLazyListState = rememberReorderableLazyListState(listState) { from, to ->
+                    subtleHaptic()
                     orderedSubscriptions = orderedSubscriptions.toMutableList().apply {
                         add(to.index, removeAt(from.index))
                     }
@@ -6423,9 +10701,14 @@ fun SubscriptionsScreen(
                             val interactionSource = remember { MutableInteractionSource() }
                             val elevation by animateDpAsState(if (isDragging) 16.dp else 0.dp)
                             val scale by animateFloatAsState(if (isDragging) 1.04f else 1f)
+                            val isAuthenticated = authenticatedFeeds.contains(FeedCredentialsManager.normalizeUrlKey(podcast.feedUrl))
+                            val (unplayedCount, downloadedCount) = getSubscriptionBadgeCounts(podcast)
 
                             Surface(
-                                onClick = { vm.loadSubscriptionPodcastEpisodes(podcast) },
+                                onClick = {
+                                    subtleHaptic()
+                                    vm.loadSubscriptionPodcastEpisodes(podcast)
+                                },
                                 shape = RoundedCornerShape(28.dp),
                                 color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = if (isDragging) 0.95f else 0.6f),
                                 shadowElevation = elevation,
@@ -6457,11 +10740,11 @@ fun SubscriptionsScreen(
                                         contentDescription = podcast.title,
                                         contentScale = ContentScale.Crop,
                                         modifier = Modifier
-                                            .size(76.dp)
-                                            .clip(RoundedCornerShape(22.dp))
+                                            .size(72.dp)
+                                            .clip(RoundedCornerShape(20.dp))
                                             .background(MaterialTheme.colorScheme.surfaceVariant)
                                     )
-                                    Spacer(Modifier.width(16.dp))
+                                    Spacer(Modifier.width(14.dp))
                                     Column(Modifier.weight(1f)) {
                                         Text(
                                             text = podcast.title,
@@ -6469,15 +10752,69 @@ fun SubscriptionsScreen(
                                             fontWeight = FontWeight.ExtraBold,
                                             maxLines = 2
                                         )
-                                        Text(
-                                            text = podcast.author,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                            maxLines = 1
-                                        )
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                        ) {
+                                            if (isAuthenticated) {
+                                                Icon(
+                                                    Icons.Default.Lock,
+                                                    contentDescription = "Private Authenticated Feed",
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(14.dp)
+                                                )
+                                            }
+                                            Text(
+                                                text = podcast.author,
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                                maxLines = 1,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        val displayUnplayed = showUnplayedBadge && unplayedCount > 0
+                                        val displayDownloaded = showDownloadedBadge && downloadedCount > 0
+                                        if (displayUnplayed || displayDownloaded) {
+                                            Spacer(Modifier.height(6.dp))
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                if (displayUnplayed) {
+                                                    SubscriptionEpisodeBadge(
+                                                        count = unplayedCount,
+                                                        containerColor = MaterialTheme.colorScheme.primary,
+                                                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                                                        icon = Icons.Default.Podcasts,
+                                                        compact = false
+                                                    )
+                                                }
+                                                if (displayDownloaded) {
+                                                    SubscriptionEpisodeBadge(
+                                                        count = downloadedCount,
+                                                        containerColor = MaterialTheme.colorScheme.tertiary,
+                                                        contentColor = MaterialTheme.colorScheme.onTertiary,
+                                                        icon = Icons.Default.DownloadDone,
+                                                        compact = false
+                                                    )
+                                                }
+                                            }
+                                        }
                                     }
-                                    IconButton(onClick = { vm.toggleSubscription(podcast) }) {
-                                        Icon(Icons.Default.Star, contentDescription = "Unsubscribe", tint = MaterialTheme.colorScheme.primary)
+                                    if (LocalAudioManager.isLocalPodcast(podcast)) {
+                                        IconButton(onClick = {
+                                            subtleHaptic()
+                                            onOpenLocalAudioSettings()
+                                        }) {
+                                            Icon(Icons.Default.Edit, contentDescription = "Manage Local Audio Files", tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    } else {
+                                        IconButton(onClick = {
+                                            subtleHaptic()
+                                            vm.toggleSubscription(podcast)
+                                        }) {
+                                            Icon(Icons.Default.Star, contentDescription = "Unsubscribe", tint = MaterialTheme.colorScheme.primary)
+                                        }
                                     }
                                     Icon(
                                         Icons.Default.DragHandle,
@@ -6493,4 +10830,420 @@ fun SubscriptionsScreen(
             }
         }
     }
+}
+
+@Composable
+fun SubscriptionEpisodeBadge(
+    count: Int,
+    containerColor: Color,
+    contentColor: Color,
+    icon: ImageVector? = null,
+    compact: Boolean = false
+) {
+    val displayCount = if (count > 99) "99+" else "$count"
+    Surface(
+        shape = CircleShape,
+        color = containerColor,
+        contentColor = contentColor,
+        shadowElevation = if (compact) 3.dp else 1.dp,
+        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            modifier = Modifier
+                .defaultMinSize(minWidth = if (compact) 22.dp else 24.dp, minHeight = if (compact) 20.dp else 22.dp)
+                .padding(horizontal = if (compact) 6.dp else 8.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            if (icon != null && !compact) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = contentColor,
+                    modifier = Modifier.size(12.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+            }
+            Text(
+                text = displayCount,
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize = if (compact) 10.sp else 11.sp,
+                    lineHeight = 12.sp
+                ),
+                color = contentColor,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+fun CustomRssFeedDialog(vm: PodcastViewModel) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val subtleHaptic = rememberSubtleHaptic()
+    val editingPodcast = vm.customFeedDialogEditPodcast
+    val isEditing = editingPodcast != null
+
+    val existingCreds = remember(editingPodcast, vm.customFeedDialogInitialUrl) {
+        val targetUrl = editingPodcast?.feedUrl ?: vm.customFeedDialogInitialUrl
+        FeedCredentialsManager.getCredentials(targetUrl)
+    }
+
+    var feedUrl by remember(editingPodcast, vm.customFeedDialogInitialUrl) {
+        mutableStateOf(editingPodcast?.feedUrl ?: vm.customFeedDialogInitialUrl)
+    }
+    var requiresAuth by remember(editingPodcast, existingCreds, vm.customFeedDialogForceAuthExpanded) {
+        mutableStateOf(existingCreds != null || vm.customFeedDialogForceAuthExpanded)
+    }
+    var username by remember(editingPodcast, existingCreds) {
+        mutableStateOf(existingCreds?.username ?: "")
+    }
+    var password by remember(editingPodcast, existingCreds) {
+        mutableStateOf(existingCreds?.password ?: "")
+    }
+    var passwordVisible by remember { mutableStateOf(false) }
+    var isSubmitting by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    // Automatically extract embedded credentials if user pastes a URL with user:pass@host
+    LaunchedEffect(feedUrl) {
+        if (feedUrl.contains("@") && (feedUrl.startsWith("http", ignoreCase = true) || feedUrl.startsWith("feed", ignoreCase = true))) {
+            val (cleanUrl, embedded) = FeedCredentialsManager.extractEmbeddedCredentials(feedUrl)
+            if (embedded != null && embedded.isValid) {
+                feedUrl = cleanUrl
+                requiresAuth = true
+                if (username.isBlank()) username = embedded.username
+                if (password.isBlank()) password = embedded.password
+            }
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = {
+            if (!isSubmitting) {
+                vm.dismissCustomFeedDialog()
+            }
+        },
+        icon = {
+            Icon(
+                if (isEditing) Icons.Default.Lock else Icons.Default.RssFeed,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(28.dp)
+            )
+        },
+        title = {
+            Text(
+                text = if (isEditing) "Feed Authentication" else "Add Custom RSS Feed",
+                style = MaterialTheme.typography.headlineSmall,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = if (isEditing) {
+                        "Configure username and password for \"${editingPodcast?.title ?: "Podcast"}\"."
+                    } else {
+                        "Enter a custom or private podcast RSS feed URL (such as Patreon, Substack, Memberful, Supercast, or self-hosted feeds)."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                OutlinedTextField(
+                    value = feedUrl,
+                    onValueChange = {
+                        feedUrl = it
+                        errorMessage = null
+                    },
+                    label = { Text("RSS Feed URL") },
+                    placeholder = { Text("https://example.com/feed.xml") },
+                    singleLine = true,
+                    enabled = !isSubmitting && !isEditing,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    leadingIcon = {
+                        Icon(Icons.Default.RssFeed, contentDescription = null)
+                    },
+                    trailingIcon = {
+                        if (!isEditing) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (feedUrl.isNotBlank()) {
+                                    IconButton(onClick = {
+                                        subtleHaptic()
+                                        feedUrl = ""
+                                    }) {
+                                        Icon(Icons.Default.Close, contentDescription = "Clear URL")
+                                    }
+                                } else {
+                                    IconButton(
+                                        onClick = {
+                                            subtleHaptic()
+                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                            val clipText = clipboard?.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()?.trim()
+                                            if (!clipText.isNullOrBlank()) {
+                                                feedUrl = clipText
+                                                errorMessage = null
+                                            } else {
+                                                Toast.makeText(context, "Clipboard is empty", Toast.LENGTH_SHORT).show()
+                                            }
+                                        }
+                                    ) {
+                                        Icon(Icons.Default.ContentPaste, contentDescription = "Paste from clipboard")
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Uri,
+                        imeAction = if (requiresAuth) ImeAction.Next else ImeAction.Done
+                    )
+                )
+
+                // Authentication Toggle Card
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.6f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .clickable(enabled = !isSubmitting) {
+                            subtleHaptic()
+                            requiresAuth = !requiresAuth
+                        }
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                if (requiresAuth) Icons.Default.Lock else Icons.Default.LockOpen,
+                                contentDescription = null,
+                                tint = if (requiresAuth) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Column {
+                                Text(
+                                    text = "Requires Username & Password",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "Enable for password-protected private feeds",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                        Switch(
+                            checked = requiresAuth,
+                            onCheckedChange = {
+                                subtleHaptic()
+                                requiresAuth = it
+                            },
+                            enabled = !isSubmitting
+                        )
+                    }
+                }
+
+                AnimatedVisibility(visible = requiresAuth) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = username,
+                            onValueChange = {
+                                username = it
+                                errorMessage = null
+                            },
+                            label = { Text("Username") },
+                            placeholder = { Text("Enter username or email") },
+                            singleLine = true,
+                            enabled = !isSubmitting,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            leadingIcon = {
+                                Icon(Icons.Default.Person, contentDescription = null)
+                            },
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Email,
+                                imeAction = ImeAction.Next
+                            )
+                        )
+
+                        OutlinedTextField(
+                            value = password,
+                            onValueChange = {
+                                password = it
+                                errorMessage = null
+                            },
+                            label = { Text("Password") },
+                            placeholder = { Text("Enter password or token") },
+                            singleLine = true,
+                            enabled = !isSubmitting,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(16.dp),
+                            visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                            leadingIcon = {
+                                Icon(Icons.Default.Key, contentDescription = null)
+                            },
+                            trailingIcon = {
+                                IconButton(onClick = {
+                                    subtleHaptic()
+                                    passwordVisible = !passwordVisible
+                                }) {
+                                    Icon(
+                                        if (passwordVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = if (passwordVisible) "Hide password" else "Show password"
+                                    )
+                                }
+                            },
+                            keyboardOptions = KeyboardOptions(
+                                keyboardType = KeyboardType.Password,
+                                imeAction = ImeAction.Done
+                            )
+                        )
+
+                        if (isEditing && existingCreds != null && editingPodcast != null) {
+                            OutlinedButton(
+                                onClick = {
+                                    subtleHaptic()
+                                    vm.removeFeedCredentials(editingPodcast)
+                                    Toast.makeText(context, "Removed saved credentials", Toast.LENGTH_SHORT).show()
+                                    vm.dismissCustomFeedDialog()
+                                },
+                                enabled = !isSubmitting,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = MaterialTheme.colorScheme.error
+                                )
+                            ) {
+                                Icon(Icons.Default.DeleteOutline, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Remove Saved Credentials")
+                            }
+                        }
+                    }
+                }
+
+                errorMessage?.let { msg ->
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.ErrorOutline,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                text = msg,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    subtleHaptic()
+                    val trimmedUrl = feedUrl.trim()
+                    if (trimmedUrl.isBlank()) {
+                        errorMessage = "Please enter an RSS feed URL."
+                        return@Button
+                    }
+                    if (requiresAuth && username.isBlank() && password.isBlank()) {
+                        errorMessage = "Please enter a username or password, or turn off the authentication toggle."
+                        return@Button
+                    }
+
+                    isSubmitting = true
+                    errorMessage = null
+                    scope.launch {
+                        val userToUse = if (requiresAuth) username else ""
+                        val passToUse = if (requiresAuth) password else ""
+                        when (val result = vm.addOrUpdateCustomFeed(
+                            rawUrl = trimmedUrl,
+                            username = userToUse,
+                            password = passToUse,
+                            existingPodcast = editingPodcast
+                        )) {
+                            is NetworkModule.FeedFetchResult.Success -> {
+                                isSubmitting = false
+                                val title = result.parsedFeed.channelTitle.ifBlank { editingPodcast?.title ?: "Podcast" }
+                                Toast.makeText(
+                                    context,
+                                    if (isEditing) "Credentials saved for $title" else "Subscribed to $title!",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                vm.dismissCustomFeedDialog()
+                            }
+                            is NetworkModule.FeedFetchResult.AuthRequired -> {
+                                isSubmitting = false
+                                requiresAuth = true
+                                errorMessage = result.message
+                            }
+                            is NetworkModule.FeedFetchResult.Error -> {
+                                isSubmitting = false
+                                errorMessage = result.message
+                            }
+                        }
+                    }
+                },
+                enabled = !isSubmitting
+            ) {
+                if (isSubmitting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(18.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("Verifying...")
+                } else {
+                    Text(if (isEditing) "Save & Verify" else "Add Feed")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = {
+                    subtleHaptic()
+                    vm.dismissCustomFeedDialog()
+                },
+                enabled = !isSubmitting
+            ) {
+                Text("Cancel")
+            }
+        }
+    )
 }

@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">ExpressoPod</string>
+    <string name="turntable_widget_name">Turntable</string>
+    <string name="turntable_widget_description">Circular podcast cover art with Play/Pause control</string>
 </resources>
