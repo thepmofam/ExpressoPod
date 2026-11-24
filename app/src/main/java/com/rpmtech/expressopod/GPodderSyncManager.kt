@@ -611,7 +611,7 @@ object GPodderSyncManager {
         val initialReq = Request.Builder()
             .url(url)
             .method(method, body)
-            .header("User-Agent", "ExpressoPod/1.1 (Android; gPodderSync)")
+            .header("User-Agent", "ExpressoPod/1.0 (Android; gPodderSync)")
             .header("Accept", "application/json")
             .header("Authorization", basicAuth)
             .build()
@@ -630,7 +630,7 @@ object GPodderSyncManager {
             val retryReq = Request.Builder()
                 .url(redirectedUrl)
                 .method(method, retryBody)
-                .header("User-Agent", "ExpressoPod/1.1 (Android; gPodderSync)")
+                .header("User-Agent", "ExpressoPod/1.0 (Android; gPodderSync)")
                 .header("Accept", "application/json")
                 .header("Authorization", basicAuth)
                 .build()
@@ -947,14 +947,11 @@ object GPodderSyncManager {
         val cleanAudio = audioUrl.trim()
         if (cleanAudio.isBlank()) return fallbackPodcastUrl?.trim().orEmpty()
 
-        if (!fallbackPodcastUrl.isNullOrBlank() && !LocalAudioManager.isLocalFeedUrl(fallbackPodcastUrl)) {
-            episodeToFeedMap[cleanAudio] = fallbackPodcastUrl.trim()
-            return fallbackPodcastUrl.trim()
+        episodeToFeedMap[cleanAudio]?.takeIf { it.isNotBlank() && !LocalAudioManager.isLocalFeedUrl(it) }?.let {
+            return it
         }
 
-        episodeToFeedMap[cleanAudio]?.takeIf { it.isNotBlank() }?.let { return it }
-
-        // Checkexpressopod_sub_episodes_cache
+        // Check expressopod_sub_episodes_cache before falling back so we never overwrite a known feed mapping
         try {
             val sp = context.applicationContext.getSharedPreferences("expressopod_sub_episodes_cache", Context.MODE_PRIVATE)
             val json = sp.getString("feed_episodes_map", null)
@@ -987,6 +984,11 @@ object GPodderSyncManager {
                 }
             }
         } catch (_: Exception) {}
+
+        if (!fallbackPodcastUrl.isNullOrBlank() && !LocalAudioManager.isLocalFeedUrl(fallbackPodcastUrl)) {
+            episodeToFeedMap[cleanAudio] = fallbackPodcastUrl.trim()
+            return fallbackPodcastUrl.trim()
+        }
 
         return ""
     }
@@ -1053,10 +1055,10 @@ object GPodderSyncManager {
         val ctx = context.applicationContext
         val resolvedPodcast = findPodcastUrlForEpisode(ctx, cleanEp, podcastUrl)
         val posSec = (positionMs / 1000L).toInt().coerceAtLeast(0)
-        val knownDurSec = if (durationMs > 0L) {
-            (durationMs / 1000L).toInt().also { episodeDurationSecMap[cleanEp] = it }
-        } else {
-            episodeDurationSecMap[cleanEp] ?: 0
+        val incomingDurSec = if (durationMs > 0L) (durationMs / 1000L).toInt() else 0
+        val existingDurSec = episodeDurationSecMap[cleanEp] ?: 0
+        val knownDurSec = maxOf(incomingDurSec, existingDurSec).also {
+            if (it > 0) episodeDurationSecMap[cleanEp] = it
         }
 
         val startSec = sessionStartPosSecMap.getOrPut(cleanEp) { posSec }
@@ -1093,10 +1095,10 @@ object GPodderSyncManager {
         val resolvedPodcast = findPodcastUrlForEpisode(ctx, cleanEp, podcastUrl)
         if (resolvedPodcast.isBlank()) return
 
-        val knownDurSec = if (durationMs > 0L) {
-            (durationMs / 1000L).toInt().also { episodeDurationSecMap[cleanEp] = it }
-        } else {
-            episodeDurationSecMap[cleanEp] ?: 0
+        val incomingDurSec = if (durationMs > 0L) (durationMs / 1000L).toInt() else 0
+        val existingDurSec = episodeDurationSecMap[cleanEp] ?: 0
+        val knownDurSec = maxOf(incomingDurSec, existingDurSec).also {
+            if (it > 0) episodeDurationSecMap[cleanEp] = it
         }
         val deviceId = _syncState.value.config.deviceId.ifBlank { GPodderConfig.DEFAULT_DEVICE_ID }
         val nowIso = formatGPodderTimestamp(System.currentTimeMillis())
@@ -1147,7 +1149,11 @@ object GPodderSyncManager {
         if (resolvedPodcast.isBlank()) return
 
         if (durationMs > 0L) {
-            episodeDurationSecMap[cleanEp] = (durationMs / 1000L).toInt()
+            val incomingSec = (durationMs / 1000L).toInt()
+            val existingSec = episodeDurationSecMap[cleanEp] ?: 0
+            if (incomingSec > existingSec) {
+                episodeDurationSecMap[cleanEp] = incomingSec
+            }
         }
 
         // If archived automatically on playback completion, onEpisodePlayedStateChanged already recorded the 100% play action
@@ -1643,8 +1649,8 @@ object GPodderSyncManager {
             }
         }
 
-        if (serverTimestamp == 0L) {
-            serverTimestamp = System.currentTimeMillis() / 1000L
+        if (serverTimestamp <= lastTimestamp) {
+            serverTimestamp = maxOf(lastTimestamp, (System.currentTimeMillis() / 1000L) - 2L)
         }
 
         synchronized(this) {
@@ -1737,6 +1743,24 @@ object GPodderSyncManager {
         val posPrefs = context.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
         val currentPositions = loadPositionsFromPrefs(posPrefs).toMutableMap()
 
+        // Load pending outgoing local actions and previous snapshots BEFORE applying remote actions
+        // so that newer pending local completions/archives/positions are never overwritten by stale server state.
+        val actionsToPushMap = LinkedHashMap<String, GPodderEpisodeAction>()
+        synchronized(this) {
+            val queued = loadEpisodeActionsJson(sp.getString(KEY_PENDING_EP_ACTIONS, null))
+            for (q in queued) {
+                if (q.podcast.isNotBlank() && q.episode.isNotBlank()) {
+                    actionsToPushMap[q.episode] = q
+                }
+            }
+        }
+
+        val prevSnapshotPlayed = loadStringSetJson(sp.getString(KEY_SNAPSHOT_PLAYED, null))
+        val prevSnapshotArchived = loadStringSetJson(sp.getString(KEY_SNAPSHOT_ARCHIVED, null))
+        val prevSnapshotPositions = loadStringLongMapJson(sp.getString(KEY_SNAPSHOT_POSITIONS, null))
+        val locallyNewlyPlayed = if (!isInitialEpSync) (currentPlayed - prevSnapshotPlayed) else emptySet()
+        val locallyNewlyArchived = if (!isInitialEpSync) (currentArchived - prevSnapshotArchived) else emptySet()
+
         // Sort remote actions chronologically by timestamp so the latest action for each episode wins
         val sortedRemoteActions = remoteActions.withIndex()
             .sortedWith(compareBy<IndexedValue<GPodderEpisodeAction>> { parseGPodderTimestampMs(it.value.timestamp) }.thenBy { it.index })
@@ -1751,16 +1775,38 @@ object GPodderSyncManager {
             val canonicalEpUrl = resolveCanonicalEpisodeUrl(rawEpisodeUrl, remote.podcast)
             val podcastUrl = remote.podcast.trim()
             if (podcastUrl.isNotBlank()) {
-                episodeToFeedMap[canonicalEpUrl] = podcastUrl
-                if (rawEpisodeUrl != canonicalEpUrl) {
+                if (!episodeToFeedMap.containsKey(canonicalEpUrl)) {
+                    episodeToFeedMap[canonicalEpUrl] = podcastUrl
+                }
+                if (rawEpisodeUrl != canonicalEpUrl && !episodeToFeedMap.containsKey(rawEpisodeUrl)) {
                     episodeToFeedMap[rawEpisodeUrl] = podcastUrl
                 }
             }
             if (remote.total != null && remote.total > 0) {
-                episodeDurationSecMap[canonicalEpUrl] = remote.total
-                if (rawEpisodeUrl != canonicalEpUrl) {
-                    episodeDurationSecMap[rawEpisodeUrl] = remote.total
+                val existingDur = episodeDurationSecMap[canonicalEpUrl] ?: 0
+                if (remote.total > existingDur) {
+                    episodeDurationSecMap[canonicalEpUrl] = remote.total
                 }
+                if (rawEpisodeUrl != canonicalEpUrl) {
+                    val existingRawDur = episodeDurationSecMap[rawEpisodeUrl] ?: 0
+                    if (remote.total > existingRawDur) {
+                        episodeDurationSecMap[rawEpisodeUrl] = remote.total
+                    }
+                }
+            }
+
+            // If there is a pending local action for this episode that is newer or equal, or if this episode
+            // was newly completed/archived locally since the last sync, do not let an older remote action revert it.
+            val pendingLocal = actionsToPushMap[canonicalEpUrl] ?: actionsToPushMap[rawEpisodeUrl]
+            if (pendingLocal != null) {
+                val localTs = parseGPodderTimestampMs(pendingLocal.timestamp)
+                val remoteTs = parseGPodderTimestampMs(remote.timestamp)
+                if (remoteTs == 0L || localTs >= remoteTs) {
+                    continue
+                }
+            }
+            if (locallyNewlyPlayed.contains(canonicalEpUrl) || locallyNewlyArchived.contains(canonicalEpUrl)) {
+                continue
             }
 
             val act = remote.action.lowercase(Locale.ROOT).trim()
@@ -1769,7 +1815,8 @@ object GPodderSyncManager {
                     remoteTouchedEpisodes.add(canonicalEpUrl)
                     val posSec = (remote.position ?: 0).coerceAtLeast(0)
                     val totalSec = (remote.total ?: episodeDurationSecMap[canonicalEpUrl] ?: 0).coerceAtLeast(0)
-                    val isCompleted = totalSec > 0 && posSec >= maxOf(1, totalSec - 5)
+                    val isCompleted = (totalSec > 0 && posSec >= maxOf(1, totalSec - 5)) ||
+                        (totalSec == 0 && currentPlayed.contains(canonicalEpUrl) && posSec > 0)
 
                     if (isCompleted) {
                         currentPlayed.add(canonicalEpUrl)
@@ -1779,6 +1826,11 @@ object GPodderSyncManager {
                         }
                         pulledAppliedCount++
                     } else if (posSec > 0) {
+                        // On servers like Nextcloud that do not store/return total duration or advance timestamps,
+                        // do not un-play/un-archive an already completed episode if this is just an echoed play action.
+                        if (isNextcloud && currentPlayed.contains(canonicalEpUrl) && prevSnapshotPlayed.contains(canonicalEpUrl)) {
+                            continue
+                        }
                         val posMs = posSec * 1000L
                         currentPositions[canonicalEpUrl] = posMs
                         currentPlayed.remove(canonicalEpUrl)
@@ -1840,20 +1892,6 @@ object GPodderSyncManager {
             }
         }
 
-        // Build outgoing local actions to push to server
-        val actionsToPushMap = LinkedHashMap<String, GPodderEpisodeAction>()
-        synchronized(this) {
-            val queued = loadEpisodeActionsJson(sp.getString(KEY_PENDING_EP_ACTIONS, null))
-            for (q in queued) {
-                if (q.podcast.isNotBlank() && q.episode.isNotBlank()) {
-                    actionsToPushMap[q.episode] = q
-                }
-            }
-        }
-
-        val prevSnapshotPlayed = loadStringSetJson(sp.getString(KEY_SNAPSHOT_PLAYED, null))
-        val prevSnapshotArchived = loadStringSetJson(sp.getString(KEY_SNAPSHOT_ARCHIVED, null))
-        val prevSnapshotPositions = loadStringLongMapJson(sp.getString(KEY_SNAPSHOT_POSITIONS, null))
         val nowIso = formatGPodderTimestamp(System.currentTimeMillis())
 
         if (isInitialEpSync) {
@@ -2004,8 +2042,8 @@ object GPodderSyncManager {
             }
         }
 
-        if (serverEpTimestamp == 0L) {
-            serverEpTimestamp = System.currentTimeMillis() / 1000L
+        if (serverEpTimestamp <= lastEpTimestamp) {
+            serverEpTimestamp = maxOf(lastEpTimestamp, (System.currentTimeMillis() / 1000L) - 2L)
         }
 
         synchronized(this) {

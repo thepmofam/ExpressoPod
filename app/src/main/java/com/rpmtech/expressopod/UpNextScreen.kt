@@ -44,12 +44,16 @@ fun UpNextScreen(
     val currentEpisode = vm.currentEpisode
     val currentPodcast = vm.currentPodcast
     val hasNowPlaying = currentEpisode != null && currentPodcast != null
-    val queuedItems = remember(vm.upNextQueue, currentEpisode?.audioUrl) {
-        if (currentEpisode != null) {
-            vm.upNextQueue.filterNot { it.episode.audioUrl == currentEpisode.audioUrl }
-        } else {
-            vm.upNextQueue
-        }
+    val archivedEpisodes by vm.archivedEpisodes.collectAsState()
+    val playedEpisodes by vm.playedEpisodes.collectAsState()
+    val queuedItems = remember(vm.upNextQueue, currentEpisode?.audioUrl, archivedEpisodes, playedEpisodes) {
+        vm.upNextQueue
+            .filterNot {
+                (currentEpisode != null && it.episode.audioUrl == currentEpisode.audioUrl) ||
+                    archivedEpisodes.contains(it.episode.audioUrl) ||
+                    playedEpisodes.contains(it.episode.audioUrl)
+            }
+            .distinctBy { it.episode.audioUrl.ifBlank { "${it.episode.title}_${it.podcast.feedUrl}" } }
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
@@ -58,9 +62,9 @@ fun UpNextScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Column {
-                Text(
-                    "Up Next Queue",
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
+                    text = "Up Next Queue",
                     style = MaterialTheme.typography.headlineSmall,
                     fontWeight = FontWeight.Bold
                 )
@@ -86,13 +90,17 @@ fun UpNextScreen(
             }
         } else {
             val listState = rememberLazyListState()
-            val itemIndexOffset = if (hasNowPlaying) 2 else 0
+            val itemIndexOffset by rememberUpdatedState(if (hasNowPlaying) 2 else 0)
             val reorderableLazyListState = rememberReorderableLazyListState(listState) { from, to ->
-                val fromQueueIdx = from.index - itemIndexOffset
-                val toQueueIdx = to.index - itemIndexOffset
-                if (fromQueueIdx in vm.upNextQueue.indices && toQueueIdx in vm.upNextQueue.indices) {
+                if (vm.reorderUpNextItemByKey(from.key, to.key)) {
                     subtleHaptic()
-                    vm.reorderUpNextItem(fromQueueIdx, toQueueIdx)
+                } else {
+                    val fromQueueIdx = from.index - itemIndexOffset
+                    val toQueueIdx = to.index - itemIndexOffset
+                    if (fromQueueIdx in vm.upNextQueue.indices && toQueueIdx in vm.upNextQueue.indices) {
+                        subtleHaptic()
+                        vm.reorderUpNextItem(fromQueueIdx, toQueueIdx)
+                    }
                 }
             }
 
@@ -116,10 +124,10 @@ fun UpNextScreen(
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(16.dp)
                                 )
-                                Text(
+                                AutoFitSingleLineText(
                                     text = if (vm.isPlaying) "NOW PLAYING" else "PAUSED",
                                     style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.ExtraBold,
+                                    fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.primary
                                 )
                             }
@@ -230,10 +238,10 @@ fun UpNextScreen(
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.spacedBy(12.dp)
                             ) {
-                                Text(
+                                AutoFitSingleLineText(
                                     text = if (queuedItems.isNotEmpty()) "NEXT IN QUEUE (${queuedItems.size})" else "NEXT IN QUEUE",
                                     style = MaterialTheme.typography.labelMedium,
-                                    fontWeight = FontWeight.ExtraBold,
+                                    fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.padding(start = 4.dp)
                                 )

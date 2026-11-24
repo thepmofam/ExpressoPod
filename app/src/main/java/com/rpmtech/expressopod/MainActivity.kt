@@ -43,8 +43,10 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.gestures.scrollable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.lazy.grid.items
@@ -89,7 +91,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
@@ -97,15 +101,19 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.Hyphens
 import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Popup
@@ -312,7 +320,9 @@ object QueueStorageManager {
         if (json.isNullOrBlank()) return emptyList()
         return try {
             val list: List<QueueItem?> = appGson.fromJson(json, queueItemListType) ?: emptyList()
-            list.filterNotNull().filter { !it.episode.audioUrl.isNullOrBlank() }
+            list.filterNotNull()
+                .filter { !it.episode.audioUrl.isNullOrBlank() }
+                .distinctBy { it.episode.audioUrl.trim() }
         } catch (_: Exception) {
             emptyList()
         }
@@ -604,7 +614,12 @@ object NetworkModule {
     private var _okHttp: OkHttpClient? = null
 
     private val authInterceptor = Interceptor { chain ->
-        val originalReq = chain.request()
+        val rawReq = chain.request()
+        val originalReq = if (rawReq.header("User-Agent") == null) {
+            rawReq.newBuilder().header("User-Agent", "ExpressoPod/1.0").build()
+        } else {
+            rawReq
+        }
         val urlStr = originalReq.url.toString()
         if (originalReq.header("Authorization") != null || FeedCredentialsManager.hasConflictingQueryAuth(urlStr)) {
             return@Interceptor chain.proceed(originalReq)
@@ -745,6 +760,7 @@ object NetworkModule {
         var channelTitle = ""
         var channelAuthor = ""
         var channelImage = ""
+        var firstItemImage = ""
         var channelDescription = ""
         var channelLink = ""
         var sawRssOrFeedRoot = false
@@ -815,22 +831,59 @@ object NetworkModule {
                                 title = ""; audioUrl = ""; pubDate = ""; duration = ""; description = ""; chaptersUrl = ""
                             } else if (tagName.equals("image", true)) {
                                 insideImage = true
+                                val imgAttr = parser.getAttributeValue(null, "href")?.trim()?.takeIf { it.isNotBlank() }
+                                    ?: parser.getAttributeValue(null, "url")?.trim()?.takeIf { it.isNotBlank() }
+                                if (!imgAttr.isNullOrBlank()) {
+                                    if (!insideItem && channelImage.isBlank()) {
+                                        channelImage = imgAttr
+                                    } else if (insideItem && firstItemImage.isBlank()) {
+                                        firstItemImage = imgAttr
+                                    }
+                                }
                             } else if (insideItem) {
                                 when {
-                                    tagName.equals("title", true) -> title = readTextSafe()
+                                    tagName.equals("title", true) -> {
+                                        val t = readTextSafe()
+                                        if (!insideImage && title.isBlank() && t.isNotBlank()) {
+                                            title = t
+                                        }
+                                    }
                                     tagName.equals("pubDate", true) || tagName.equals("published", true) || tagName.equals("updated", true) -> {
                                         if (pubDate.isBlank()) pubDate = readTextSafe().take(16)
                                     }
                                     (tagName.equals("itunes:duration", true) || tagName.equals("duration", true)) -> duration = formatDurationText(readTextSafe())
-                                    tagName.equals("enclosure", true) -> audioUrl = parser.getAttributeValue(null, "url") ?: audioUrl
-                                    tagName.equals("media:content", true) -> {
-                                        if (audioUrl.isBlank()) {
-                                            val medium = parser.getAttributeValue(null, "medium") ?: ""
-                                            val type = parser.getAttributeValue(null, "type") ?: ""
-                                            val urlAttr = parser.getAttributeValue(null, "url") ?: ""
-                                            if (urlAttr.isNotBlank() && (medium.equals("audio", true) || type.startsWith("audio/", true) || urlAttr.contains(".mp3", true) || urlAttr.contains(".m4a", true))) {
-                                                audioUrl = urlAttr
+                                    tagName.equals("enclosure", true) -> {
+                                        val urlAttr = parser.getAttributeValue(null, "url")?.trim() ?: ""
+                                        val typeAttr = parser.getAttributeValue(null, "type")?.trim() ?: ""
+                                        if (urlAttr.isNotBlank()) {
+                                            val isAudioType = typeAttr.isBlank() || typeAttr.startsWith("audio/", true) ||
+                                                urlAttr.contains(".mp3", true) || urlAttr.contains(".m4a", true) ||
+                                                urlAttr.contains(".ogg", true) || urlAttr.contains(".opus", true) ||
+                                                urlAttr.contains(".aac", true) || urlAttr.contains(".wav", true)
+                                            if (audioUrl.isBlank() || isAudioType) {
+                                                if (audioUrl.isBlank()) {
+                                                    audioUrl = urlAttr
+                                                }
                                             }
+                                        }
+                                    }
+                                    tagName.equals("media:content", true) -> {
+                                        val medium = parser.getAttributeValue(null, "medium") ?: ""
+                                        val type = parser.getAttributeValue(null, "type") ?: ""
+                                        val urlAttr = parser.getAttributeValue(null, "url")?.trim() ?: ""
+                                        if (urlAttr.isNotBlank()) {
+                                            if (audioUrl.isBlank() && (medium.equals("audio", true) || type.startsWith("audio/", true) || urlAttr.contains(".mp3", true) || urlAttr.contains(".m4a", true))) {
+                                                audioUrl = urlAttr
+                                            } else if (firstItemImage.isBlank() && (medium.equals("image", true) || type.startsWith("image/", true))) {
+                                                firstItemImage = urlAttr
+                                            }
+                                        }
+                                    }
+                                    tagName.equals("itunes:image", true) || tagName.equals("googleplay:image", true) || tagName.equals("media:thumbnail", true) -> {
+                                        val imgAttr = parser.getAttributeValue(null, "href")?.trim()?.takeIf { it.isNotBlank() }
+                                            ?: parser.getAttributeValue(null, "url")?.trim()?.takeIf { it.isNotBlank() }
+                                        if (!imgAttr.isNullOrBlank() && firstItemImage.isBlank()) {
+                                            firstItemImage = imgAttr
                                         }
                                     }
                                     tagName.equals("link", true) -> {
@@ -869,12 +922,34 @@ object NetworkModule {
                                         val p = readTextSafe()
                                         if (channelAuthor.isBlank() && p.isNotBlank()) channelAuthor = p
                                     }
-                                    tagName.equals("itunes:image", true) -> channelImage = parser.getAttributeValue(null, "href") ?: channelImage
+                                    tagName.equals("itunes:image", true) || tagName.equals("googleplay:image", true) -> {
+                                        val imgAttr = parser.getAttributeValue(null, "href")?.trim()?.takeIf { it.isNotBlank() }
+                                            ?: parser.getAttributeValue(null, "url")?.trim()?.takeIf { it.isNotBlank() }
+                                            ?: readTextSafe().takeIf { it.isNotBlank() }
+                                        if (!imgAttr.isNullOrBlank()) {
+                                            channelImage = imgAttr
+                                        }
+                                    }
+                                    tagName.equals("media:thumbnail", true) || tagName.equals("media:content", true) -> {
+                                        if (channelImage.isBlank()) {
+                                            val medium = parser.getAttributeValue(null, "medium") ?: ""
+                                            val type = parser.getAttributeValue(null, "type") ?: ""
+                                            val urlAttr = parser.getAttributeValue(null, "url")?.trim() ?: ""
+                                            if (urlAttr.isNotBlank() && (tagName.equals("media:thumbnail", true) || medium.equals("image", true) || type.startsWith("image/", true))) {
+                                                channelImage = urlAttr
+                                            }
+                                        }
+                                    }
                                     tagName.equals("logo", true) || tagName.equals("icon", true) -> {
                                         val img = readTextSafe()
                                         if (channelImage.isBlank() && img.isNotBlank()) channelImage = img
                                     }
-                                    tagName.equals("url", true) && insideImage -> channelImage = readTextSafe()
+                                    tagName.equals("url", true) && insideImage -> {
+                                        val img = readTextSafe()
+                                        if (img.isNotBlank() && channelImage.isBlank()) {
+                                            channelImage = img
+                                        }
+                                    }
                                     (tagName.equals("description", true) || tagName.equals("itunes:summary", true) || tagName.equals("subtitle", true)) && !insideImage -> {
                                         val d = readTextSafe()
                                         if (channelDescription.isBlank() && d.isNotBlank()) channelDescription = d
@@ -921,7 +996,8 @@ object NetworkModule {
 
         val finalTitle = channelTitle.ifBlank { "Custom Podcast" }
         val finalAuthor = channelAuthor.ifBlank { "Unknown" }
-        val result = ParsedFeed(finalTitle, finalAuthor, channelImage, episodes, channelDescription, channelLink)
+        val resolvedChannelImage = ArtworkResolver.normalizeUrl(channelImage.ifBlank { firstItemImage }, cleanFeedUrl)
+        val result = ParsedFeed(finalTitle, finalAuthor, resolvedChannelImage, episodes, channelDescription, channelLink)
         feedCache[cleanFeedUrl] = result
         feedCache[rawFeedUrl] = result
         if (episodes.isNotEmpty()) {
@@ -935,6 +1011,152 @@ object NetworkModule {
         when (val res = fetchPodcastFeedResult(feedUrl)) {
             is FeedFetchResult.Success -> res.parsedFeed
             else -> getCachedFeed(feedUrl)
+        }
+    }
+}
+
+object ArtworkResolver {
+    fun feedsEquivalent(a: String?, b: String?): Boolean {
+        val rawA = a?.trim().orEmpty()
+        val rawB = b?.trim().orEmpty()
+        if (rawA.isEmpty() || rawB.isEmpty()) return false
+        if (rawA.equals(rawB, ignoreCase = true)) return true
+        val normA = FeedCredentialsManager.normalizeUrlKey(rawA)
+        val normB = FeedCredentialsManager.normalizeUrlKey(rawB)
+        return normA.isNotBlank() && normA.equals(normB, ignoreCase = true)
+    }
+
+    fun normalizeUrl(rawUrl: String?, feedUrl: String? = null): String {
+        val trimmed = rawUrl?.trim()?.replace("\n", "")?.replace("\r", "")?.replace("\t", "") ?: ""
+        if (trimmed.isEmpty()) return ""
+        val withScheme = if (trimmed.startsWith("//")) {
+            "https:$trimmed"
+        } else if (
+            !trimmed.startsWith("http://", ignoreCase = true) &&
+            !trimmed.startsWith("https://", ignoreCase = true) &&
+            !trimmed.startsWith("file://", ignoreCase = true) &&
+            !trimmed.startsWith("content://", ignoreCase = true) &&
+            !feedUrl.isNullOrBlank()
+        ) {
+            try {
+                java.net.URI(feedUrl.trim()).resolve(trimmed).toString()
+            } catch (_: Exception) {
+                trimmed
+            }
+        } else {
+            trimmed
+        }
+        return withScheme.replace(" ", "%20")
+    }
+
+    fun toSafeUri(rawUrl: String?, feedUrl: String? = null): Uri? {
+        val norm = normalizeUrl(rawUrl, feedUrl)
+        if (norm.isBlank()) return null
+        return try {
+            Uri.parse(norm)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun resolveBestArtworkUrl(
+        context: Context,
+        podcast: Podcast?,
+        episode: Episode? = null
+    ): String {
+        val feedUrl = podcast?.feedUrl?.trim().orEmpty()
+        val podTitle = podcast?.title?.trim().orEmpty()
+        val epUrl = episode?.audioUrl?.trim().orEmpty()
+
+        val direct = normalizeUrl(podcast?.artworkUrl, feedUrl)
+        if (direct.isNotBlank()) return direct
+
+        if (podcast != null && LocalAudioManager.isLocalPodcast(podcast)) {
+            val localArt = LocalAudioManager.getInstance(context).getCoverArtworkUri()
+            if (localArt.isNotBlank()) return localArt
+        }
+
+        if (feedUrl.isNotBlank()) {
+            val cachedImg = normalizeUrl(NetworkModule.getCachedFeed(feedUrl)?.channelImage, feedUrl)
+            if (cachedImg.isNotBlank()) return cachedImg
+        }
+
+        val subs = SubscriptionStorageManager.loadSubscriptionsFromBackup(context)
+        val matchedSub = subs.find { sub ->
+            (feedUrl.isNotBlank() && sub.feedUrl.isNotBlank() && ArtworkResolver.feedsEquivalent(sub.feedUrl, feedUrl)) ||
+                (podTitle.isNotBlank() && sub.title.trim().equals(podTitle, ignoreCase = true))
+        }
+        if (matchedSub != null) {
+            val subArt = normalizeUrl(matchedSub.artworkUrl, matchedSub.feedUrl.ifBlank { feedUrl })
+            if (subArt.isNotBlank()) return subArt
+            if (matchedSub.feedUrl.isNotBlank()) {
+                val subCachedImg = normalizeUrl(NetworkModule.getCachedFeed(matchedSub.feedUrl)?.channelImage, matchedSub.feedUrl)
+                if (subCachedImg.isNotBlank()) return subCachedImg
+            }
+        }
+
+        try {
+            val downloads = PodcastDownloadManager.getInstance(context).downloadedEpisodes.value
+            val matchedDl = downloads.find { dl ->
+                (epUrl.isNotBlank() && dl.audioUrl.trim() == epUrl) ||
+                    (podTitle.isNotBlank() && dl.podcastTitle.trim().equals(podTitle, ignoreCase = true))
+            }
+            if (matchedDl != null) {
+                val dlArt = normalizeUrl(matchedDl.podcastArtworkUrl, feedUrl)
+                if (dlArt.isNotBlank()) return dlArt
+            }
+        } catch (_: Exception) {}
+
+        val queue = QueueStorageManager.loadQueueFromBackup(context)
+        val matchedQueue = queue.find { q ->
+            (epUrl.isNotBlank() && q.episode.audioUrl.trim() == epUrl) ||
+                (feedUrl.isNotBlank() && q.podcast.feedUrl.isNotBlank() && ArtworkResolver.feedsEquivalent(q.podcast.feedUrl, feedUrl)) ||
+                (podTitle.isNotBlank() && q.podcast.title.trim().equals(podTitle, ignoreCase = true))
+        }
+        if (matchedQueue != null) {
+            val qArt = normalizeUrl(matchedQueue.podcast.artworkUrl, matchedQueue.podcast.feedUrl.ifBlank { feedUrl })
+            if (qArt.isNotBlank()) return qArt
+        }
+
+        try {
+            val statePrefs = context.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            val savedPodJson = statePrefs.getString("last_podcast", null)
+            if (!savedPodJson.isNullOrBlank()) {
+                val savedPod = appGson.fromJson(savedPodJson, Podcast::class.java)
+                if (savedPod != null) {
+                    val matchesSaved = (feedUrl.isNotBlank() && savedPod.feedUrl.isNotBlank() && ArtworkResolver.feedsEquivalent(savedPod.feedUrl, feedUrl)) ||
+                        (podTitle.isNotBlank() && savedPod.title.trim().equals(podTitle, ignoreCase = true)) ||
+                        (feedUrl.isBlank() && podTitle.isBlank())
+                    if (matchesSaved) {
+                        val sArt = normalizeUrl(savedPod.artworkUrl, savedPod.feedUrl.ifBlank { feedUrl })
+                        if (sArt.isNotBlank()) return sArt
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        return ""
+    }
+
+    fun resolveBestArtworkUri(
+        context: Context,
+        podcast: Podcast?,
+        episode: Episode? = null
+    ): Uri? {
+        val url = resolveBestArtworkUrl(context, podcast, episode)
+        return toSafeUri(url, podcast?.feedUrl)
+    }
+
+    fun enrichPodcastArtwork(
+        context: Context,
+        podcast: Podcast,
+        episode: Episode? = null
+    ): Podcast {
+        val bestUrl = resolveBestArtworkUrl(context, podcast, episode)
+        return if (bestUrl.isNotBlank() && bestUrl != podcast.artworkUrl) {
+            podcast.copy(artworkUrl = bestUrl)
+        } else {
+            podcast
         }
     }
 }
@@ -1422,12 +1644,20 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
                     if (cached != null && cached.episodes.isNotEmpty()) {
                         recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
+                        if (podcast.artworkUrl.isBlank() && cached.channelImage.isNotBlank()) {
+                            updateSubscriptionArtworkIfNeeded(podcast.feedUrl, cached.channelImage)
+                        }
                     } else if (refreshingSubscriptionFeeds.add(normKey)) {
                         launch(Dispatchers.IO) {
                             try {
                                 val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
-                                if (parsed != null && parsed.episodes.isNotEmpty()) {
-                                    recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
+                                if (parsed != null) {
+                                    if (parsed.episodes.isNotEmpty()) {
+                                        recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
+                                    }
+                                    if (podcast.artworkUrl.isBlank() && parsed.channelImage.isNotBlank()) {
+                                        updateSubscriptionArtworkIfNeeded(podcast.feedUrl, parsed.channelImage)
+                                    }
                                 }
                             } catch (_: Exception) {
                             } finally {
@@ -1438,6 +1668,39 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
             }
         }
+    }
+
+    private suspend fun updateSubscriptionArtworkIfNeeded(feedUrl: String, resolvedArtUrl: String) {
+        val cleanArt = ArtworkResolver.normalizeUrl(resolvedArtUrl, feedUrl)
+        if (cleanArt.isBlank()) return
+        try {
+            app.dataStore.edit { prefs ->
+                val json = prefs[stringPreferencesKey("subscriptions")]
+                var current = SubscriptionStorageManager.parseSubscriptionsJson(json).toMutableList()
+                if (current.isEmpty()) {
+                    val backup = SubscriptionStorageManager.loadSubscriptionsFromBackup(app)
+                    if (backup.isNotEmpty()) current = backup.toMutableList()
+                }
+                val idx = current.indexOfFirst { ArtworkResolver.feedsEquivalent(it.feedUrl, feedUrl) }
+                if (idx != -1 && current[idx].artworkUrl.isBlank()) {
+                    current[idx] = current[idx].copy(artworkUrl = cleanArt)
+                    val updatedJson = appGson.toJson(current)
+                    prefs[stringPreferencesKey("subscriptions")] = updatedJson
+                    SubscriptionStorageManager.saveSubscriptionsToBackup(app, updatedJson)
+                }
+            }
+            withContext(Dispatchers.Main) {
+                val curPod = currentPodcast
+                if (curPod != null && curPod.artworkUrl.isBlank() && ArtworkResolver.feedsEquivalent(curPod.feedUrl, feedUrl)) {
+                    val enriched = curPod.copy(artworkUrl = cleanArt)
+                    currentPodcast = enriched
+                    val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                    statePrefs.edit().putString("last_podcast", appGson.toJson(enriched)).apply()
+                    prepareControllerWithCurrentEpisode()
+                    syncWidget()
+                }
+            }
+        } catch (_: Exception) {}
     }
 
     // Custom / Private RSS Feed Credentials State
@@ -1482,9 +1745,31 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         .stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
     var upNextQueue by mutableStateOf<List<QueueItem>>(emptyList())
+    private val pendingCompletedUrls = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private var hasRestoredQueueFromDataStore = false
+    private var loadSubscriptionFeedJob: kotlinx.coroutines.Job? = null
+    private var loadDiscoverFeedJob: kotlinx.coroutines.Job? = null
+
+    fun sanitizeQueue(list: List<QueueItem>, activeEpisodeUrl: String? = currentEpisode?.audioUrl): List<QueueItem> {
+        val played = playedEpisodes.value
+        val archived = archivedEpisodes.value
+        return list
+            .filter { it.episode.audioUrl.isNotBlank() }
+            .filterNot { item ->
+                val url = item.episode.audioUrl
+                url == activeEpisodeUrl ||
+                    played.contains(url) ||
+                    archived.contains(url) ||
+                    pendingCompletedUrls.contains(url)
+            }
+            .distinctBy { it.episode.audioUrl.trim() }
+    }
 
     fun saveUpNextQueue() {
-        val current = upNextQueue
+        val current = sanitizeQueue(upNextQueue)
+        if (current != upNextQueue) {
+            upNextQueue = current
+        }
         val json = Gson().toJson(current)
         QueueStorageManager.saveQueueToBackup(app, json)
         viewModelScope.launch(Dispatchers.IO) {
@@ -1581,15 +1866,38 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             .filterNot { it.episode.audioUrl == currentEpisode?.audioUrl }
         if (initialQueue.isNotEmpty()) {
             upNextQueue = initialQueue
+            hasRestoredQueueFromDataStore = true
         }
         viewModelScope.launch {
             app.dataStore.data.collect { prefs ->
-                val qJson = prefs[stringPreferencesKey("up_next_queue")]
-                if (!qJson.isNullOrBlank()) {
-                    val parsed = QueueStorageManager.parseQueueJson(qJson)
-                        .filterNot { it.episode.audioUrl == currentEpisode?.audioUrl }
-                    if (upNextQueue.isEmpty() && parsed.isNotEmpty()) {
-                        upNextQueue = parsed
+                val played = prefs[androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")] ?: emptySet()
+                val archived = prefs[androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")] ?: emptySet()
+
+                if (!hasRestoredQueueFromDataStore) {
+                    hasRestoredQueueFromDataStore = true
+                    val qJson = prefs[stringPreferencesKey("up_next_queue")]
+                    if (!qJson.isNullOrBlank()) {
+                        val parsed = QueueStorageManager.parseQueueJson(qJson)
+                            .filterNot {
+                                it.episode.audioUrl == currentEpisode?.audioUrl ||
+                                    played.contains(it.episode.audioUrl) ||
+                                    archived.contains(it.episode.audioUrl)
+                            }
+                        if (upNextQueue.isEmpty() && parsed.isNotEmpty()) {
+                            upNextQueue = parsed
+                        }
+                    }
+                } else if (upNextQueue.isNotEmpty()) {
+                    // Automatically prune any episodes from Up Next that were marked played or archived
+                    val pruned = upNextQueue.filterNot {
+                        it.episode.audioUrl == currentEpisode?.audioUrl ||
+                            played.contains(it.episode.audioUrl) ||
+                            archived.contains(it.episode.audioUrl) ||
+                            pendingCompletedUrls.contains(it.episode.audioUrl)
+                    }
+                    if (pruned.size != upNextQueue.size) {
+                        upNextQueue = pruned
+                        saveUpNextQueue()
                     }
                 }
                 val speedsJson = prefs[stringPreferencesKey(PlaybackSpeedManager.KEY_SPEEDS_MAP)]
@@ -1639,10 +1947,117 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         search()
     }
 
+    private fun ensurePlaybackServiceStarted() {
+        try {
+            app.startService(Intent(app, PlaybackService::class.java))
+        } catch (_: Exception) {
+            try {
+                ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun reconcileWithControllerState(): Boolean {
+        val ctrl = controller ?: return false
+        val ctrlMediaId = ctrl.currentMediaItem?.mediaId?.takeIf { it.isNotBlank() }
+        val curEpUrl = currentEpisode?.audioUrl
+
+        if (ctrlMediaId != null && ctrlMediaId != curEpUrl) {
+            val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            val savedEpJson = statePrefs.getString("last_episode", null)
+            val savedPodJson = statePrefs.getString("last_podcast", null)
+            val savedEp = if (!savedEpJson.isNullOrBlank()) {
+                try { appGson.fromJson(savedEpJson, Episode::class.java) } catch (_: Exception) { null }
+            } else null
+            val savedPod = if (!savedPodJson.isNullOrBlank()) {
+                try { appGson.fromJson(savedPodJson, Podcast::class.java) } catch (_: Exception) { null }
+            } else null
+
+            val isControllerActive = ctrl.isPlaying ||
+                ctrl.playWhenReady ||
+                ctrl.playbackState == Player.STATE_BUFFERING ||
+                ctrl.playbackState == Player.STATE_READY ||
+                savedEp?.audioUrl == ctrlMediaId
+
+            if (isControllerActive) {
+                var adoptedPod: Podcast? = null
+                var adoptedEp: Episode? = null
+
+                if (savedEp?.audioUrl == ctrlMediaId && savedPod != null) {
+                    adoptedPod = savedPod
+                    adoptedEp = savedEp
+                } else {
+                    val matchedQueueItem = upNextQueue.find { it.episode.audioUrl == ctrlMediaId }
+                        ?: QueueStorageManager.loadQueueFromBackup(app).find { it.episode.audioUrl == ctrlMediaId }
+                    if (matchedQueueItem != null) {
+                        adoptedPod = matchedQueueItem.podcast
+                        adoptedEp = matchedQueueItem.episode
+                    } else {
+                        val meta = ctrl.currentMediaItem?.mediaMetadata
+                        val title = meta?.title?.toString()?.takeIf { it.isNotBlank() } ?: "Episode"
+                        val artist = meta?.artist?.toString()?.takeIf { it.isNotBlank() } ?: "Podcast"
+                        val artUrl = meta?.artworkUri?.toString() ?: ""
+                        adoptedPod = Podcast(title = artist, author = artist, artworkUrl = artUrl, feedUrl = "")
+                        adoptedEp = Episode(title = title, audioUrl = ctrlMediaId)
+                    }
+                }
+
+                if (adoptedEp != null && adoptedPod != null) {
+                    currentPodcast = adoptedPod
+                    currentEpisode = adoptedEp
+                    isPlaying = ctrl.isPlaying
+                    if (ctrl.currentPosition > 0L) {
+                        currentPosition = ctrl.currentPosition
+                    } else {
+                        val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+                        currentPosition = posPrefs.getLong(ctrlMediaId, 0L)
+                    }
+                    val epDurMs = parseDurationMs(adoptedEp.durationText)
+                    if (ctrl.duration > 0L) {
+                        duration = ctrl.duration
+                    } else if (epDurMs > 0L) {
+                        duration = epDurMs
+                    }
+                    loadChaptersForEpisode(adoptedEp)
+                    val latestQueue = sanitizeQueue(QueueStorageManager.loadQueueFromBackup(app), ctrlMediaId)
+                    if (latestQueue != upNextQueue) {
+                        upNextQueue = latestQueue
+                    }
+                    return true
+                }
+            }
+        } else if (ctrlMediaId == null && !ctrl.isPlaying && currentEpisode != null) {
+            val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+            val savedEpJson = statePrefs.getString("last_episode", null)
+            if (savedEpJson.isNullOrBlank()) {
+                currentEpisode = null
+                currentPodcast = null
+                isPlaying = false
+                currentPosition = 0L
+                duration = 1L
+                currentChapters = emptyList()
+                val latestQueue = sanitizeQueue(QueueStorageManager.loadQueueFromBackup(app), null)
+                if (latestQueue != upNextQueue) {
+                    upNextQueue = latestQueue
+                }
+                return true
+            }
+        }
+        return false
+    }
+
     fun prepareControllerWithCurrentEpisode() {
         val ctrl = controller ?: return
-        val pod = currentPodcast ?: return
+        if (reconcileWithControllerState()) {
+            return
+        }
+        val rawPod = currentPodcast ?: return
         val ep = currentEpisode ?: return
+        val pod = ArtworkResolver.enrichPodcastArtwork(app, rawPod, ep)
+        if (pod != rawPod) {
+            currentPodcast = pod
+        }
+        val resolvedArtUri = ArtworkResolver.resolveBestArtworkUri(app, pod, ep)
 
         ctrl.setPlaybackSpeed(getPlaybackSpeedForPodcast(pod))
 
@@ -1654,6 +2069,18 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val savedPos = if (epDurationMs > 0L && rawSavedPos >= epDurationMs - 2000L) 0L else rawSavedPos
 
         if (ctrl.currentMediaItem?.mediaId == ep.audioUrl) {
+            val currentArtUri = ctrl.currentMediaItem?.mediaMetadata?.artworkUri
+            if (resolvedArtUri != null && currentArtUri != resolvedArtUri) {
+                val updatedMetadata = (ctrl.currentMediaItem?.mediaMetadata?.buildUpon() ?: MediaMetadata.Builder())
+                    .setTitle(ep.title)
+                    .setArtist(pod.title)
+                    .setArtworkUri(resolvedArtUri)
+                    .build()
+                val updatedItem = ctrl.currentMediaItem!!.buildUpon()
+                    .setMediaMetadata(updatedMetadata)
+                    .build()
+                ctrl.replaceMediaItem(0, updatedItem)
+            }
             if (ctrl.currentPosition > 0L) {
                 currentPosition = ctrl.currentPosition
             } else if (savedPos > 0L) {
@@ -1671,7 +2098,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val metadata = MediaMetadata.Builder()
             .setTitle(ep.title)
             .setArtist(pod.title)
-            .setArtworkUri(Uri.parse(pod.artworkUrl))
+            .setArtworkUri(resolvedArtUri)
             .build()
         val localUri = downloadManager.getLocalUriIfDownloaded(ep.audioUrl)
             ?: localAudioManager.getLocalUri(ep.audioUrl)
@@ -1683,12 +2110,14 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             .build()
 
         if (savedPos > 0L) {
-            ctrl.setMediaItem(item, savedPos)
+            ctrl.setMediaItems(listOf(item), 0, savedPos)
             currentPosition = savedPos
         } else {
-            ctrl.setMediaItem(item, 0L)
+            ctrl.setMediaItems(listOf(item), 0, 0L)
         }
-        ctrl.prepare()
+        if (ctrl.isPlaying || ctrl.playWhenReady) {
+            ctrl.prepare()
+        }
         if (ctrl.duration > 0L) {
             duration = ctrl.duration
         } else if (epDurationMs > 0L) {
@@ -1736,13 +2165,19 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     private fun advanceOrClearCurrentEpisode() {
-        if (upNextQueue.isNotEmpty()) {
+        val prevEpUrl = currentEpisode?.audioUrl
+        val validQueue = sanitizeQueue(upNextQueue, prevEpUrl)
+        if (validQueue.isNotEmpty()) {
             val wasPlaying = isPlaying
-            val nextItem = upNextQueue.first()
-            upNextQueue = upNextQueue.drop(1)
+            val nextItem = validQueue.first()
+            upNextQueue = validQueue.drop(1)
             saveUpNextQueue()
+            currentEpisode = null
+            currentPodcast = null
             playEpisode(nextItem.podcast, nextItem.episode, autoPlay = wasPlaying, fromQueue = isPlayingQueue, keepPreviousInQueue = false)
         } else {
+            upNextQueue = emptyList()
+            saveUpNextQueue()
             clearCurrentPlayback()
         }
     }
@@ -1750,15 +2185,16 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     fun syncPlaybackState() {
         val ctrl = controller
         if (ctrl != null) {
-            if (ctrl.playbackState == Player.STATE_ENDED && upNextQueue.isEmpty()) {
-                clearCurrentPlayback()
-                return
-            }
-            if (ctrl.currentPosition > 0L) {
-                currentPosition = ctrl.currentPosition
-            }
-            if (ctrl.duration > 0L) {
-                duration = ctrl.duration
+            reconcileWithControllerState()
+            val ctrlMediaId = ctrl.currentMediaItem?.mediaId
+            val curEpUrl = currentEpisode?.audioUrl
+            if (curEpUrl != null && ctrlMediaId == curEpUrl) {
+                if (ctrl.currentPosition > 0L) {
+                    currentPosition = ctrl.currentPosition
+                }
+                if (ctrl.duration > 0L) {
+                    duration = ctrl.duration
+                }
             }
             isPlaying = ctrl.isPlaying
             val targetSpeed = getPlaybackSpeedForPodcast(currentPodcast)
@@ -1786,9 +2222,18 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun saveCurrentPlaybackPosition(shouldQueueSyncAction: Boolean = false) {
         val ep = currentEpisode ?: return
+        if (pendingCompletedUrls.contains(ep.audioUrl) || playedEpisodes.value.contains(ep.audioUrl)) {
+            return
+        }
         val pod = currentPodcast
         val ctrl = controller
-        val isEnded = ctrl != null && (ctrl.playbackState == Player.STATE_ENDED || (ctrl.duration > 0L && ctrl.currentPosition >= ctrl.duration - 2000L))
+        val ctrlMediaId = ctrl?.currentMediaItem?.mediaId
+        // Never overwrite expressopod_state with a stale episode if the service has already switched media items
+        if (!ctrlMediaId.isNullOrBlank() && ctrlMediaId != ep.audioUrl) {
+            return
+        }
+        val ctrlMatchesEp = ctrl != null && ctrlMediaId == ep.audioUrl
+        val isEnded = ctrlMatchesEp && ctrl != null && (ctrl.playbackState == Player.STATE_ENDED || (ctrl.duration > 0L && ctrl.currentPosition >= ctrl.duration - 2000L))
         if (isEnded) {
             val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
             posPrefs.edit().remove(ep.audioUrl).apply()
@@ -1798,8 +2243,8 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             positionsVersion++
             return
         }
-        val pos = if (ctrl != null && ctrl.currentPosition > 0L) ctrl.currentPosition else currentPosition
-        val totalDur = if (ctrl != null && ctrl.duration > 0L) ctrl.duration else if (duration > 1L) duration else parseDurationMs(ep.durationText)
+        val pos = if (ctrlMatchesEp && ctrl != null && ctrl.currentPosition > 0L) ctrl.currentPosition else currentPosition
+        val totalDur = if (ctrlMatchesEp && ctrl != null && ctrl.duration > 0L) ctrl.duration else if (duration > 1L) duration else parseDurationMs(ep.durationText)
         if (pos > 0L) {
             val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
             posPrefs.edit().putLong(ep.audioUrl, pos).apply()
@@ -1844,54 +2289,25 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
             controller?.addListener(object : Player.Listener {
                 override fun onIsPlayingChanged(playing: Boolean) {
+                    reconcileWithControllerState()
                     isPlaying = playing
                     if (!playing) saveCurrentPlaybackPosition(shouldQueueSyncAction = true)
                     syncWidget()
                 }
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    reconcileWithControllerState()
+                    controller?.let { isPlaying = it.isPlaying }
+                    syncWidget()
+                }
                 override fun onMediaMetadataChanged(mediaMetadata: androidx.media3.common.MediaMetadata) {
+                    reconcileWithControllerState()
                     controller?.let { isPlaying = it.isPlaying }
                     syncWidget()
                 }
                 override fun onPlaybackStateChanged(playbackState: Int) {
+                    reconcileWithControllerState()
                     controller?.let { isPlaying = it.isPlaying }
                     syncWidget()
-                    if (playbackState == Player.STATE_ENDED) {
-                        val endedEp = currentEpisode
-                        val endedPod = currentPodcast
-                        if (endedEp != null) {
-                            val shouldKeepUnarchived = keepUnarchivedEpisodes.value.contains(endedEp.audioUrl)
-                            val shouldAutoArchive = autoArchiveEnabled.value && !shouldKeepUnarchived
-                            markEpisodePlayed(endedEp, true, fromPlaybackCompletion = true)
-                            if (shouldAutoArchive) {
-                                toggleArchive(endedEp, true, fromPlaybackCompletion = true)
-                            }
-                            val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
-                            posPrefs.edit().remove(endedEp.audioUrl).apply()
-                        }
-                        val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
-                        statePrefs.edit().putLong("last_position", 0L).apply()
-                        currentPosition = 0L
-
-                        if (upNextQueue.isNotEmpty()) {
-                            isPlayingQueue = true
-                            val nextItem = upNextQueue.first()
-                            upNextQueue = upNextQueue.drop(1)
-                            saveUpNextQueue()
-                            playEpisode(nextItem.podcast, nextItem.episode, autoPlay = true, fromQueue = true, keepPreviousInQueue = false)
-                        } else {
-                            if (isPlayingQueue) {
-                                isPlayingQueue = false
-                                playbackNavTarget = PlaybackNavTarget.SubscriptionsHome
-                            } else {
-                                if (discoverSelectedPodcast == null && subscriptionSelectedPodcast == null && endedPod != null) {
-                                    subscriptionSelectedPodcast = endedPod
-                                    loadSubscriptionPodcastEpisodes(endedPod)
-                                }
-                                playbackNavTarget = PlaybackNavTarget.EpisodeList
-                            }
-                            clearCurrentPlayback()
-                        }
-                    }
                 }
             })
         }, ContextCompat.getMainExecutor(app))
@@ -1901,18 +2317,22 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             var lastWidgetMinute = -1L
             while (true) {
                 controller?.let {
+                    if (it.currentMediaItem?.mediaId != currentEpisode?.audioUrl) {
+                        reconcileWithControllerState()
+                    }
                     if (isPlaying != it.isPlaying) {
                         isPlaying = it.isPlaying
                     }
-                    if (it.playbackState != Player.STATE_ENDED && (it.isPlaying || it.currentPosition > 0L)) {
+                    val matchesCurrentEp = currentEpisode != null && it.currentMediaItem?.mediaId == currentEpisode?.audioUrl
+                    if (matchesCurrentEp && it.playbackState != Player.STATE_ENDED && (it.isPlaying || it.currentPosition > 0L)) {
                         currentPosition = it.currentPosition
                     }
-                    if (it.duration > 0L) {
+                    if (matchesCurrentEp && it.duration > 0L) {
                         duration = it.duration
                     }
                     loopCount++
                     // Persist playback position every 2 seconds while playing
-                    if (it.isPlaying && loopCount % 4 == 0 && it.currentPosition > 0L) {
+                    if (matchesCurrentEp && it.isPlaying && loopCount % 4 == 0 && it.currentPosition > 0L) {
                         saveCurrentPlaybackPosition()
                     }
                     if (it.isPlaying) {
@@ -2106,7 +2526,8 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     fun onGPodderSyncCompleted() {
         positionsVersion++
         val ep = currentEpisode
-        if (ep != null && !isPlaying) {
+        val activelyPlaying = isPlaying || controller?.isPlaying == true || controller?.playWhenReady == true
+        if (ep != null && !activelyPlaying) {
             val played = playedEpisodes.value
             val archived = archivedEpisodes.value
             if (played.contains(ep.audioUrl) || archived.contains(ep.audioUrl)) {
@@ -2117,7 +2538,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 if (syncedPos != currentPosition) {
                     currentPosition = syncedPos
                     controller?.let { ctrl ->
-                        if (!ctrl.isPlaying && ctrl.currentMediaItem?.mediaId == ep.audioUrl) {
+                        if (!ctrl.isPlaying && !ctrl.playWhenReady && ctrl.currentMediaItem?.mediaId == ep.audioUrl) {
                             ctrl.seekTo(syncedPos)
                         }
                     }
@@ -2129,6 +2550,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun loadSubscriptionPodcastEpisodes(podcast: Podcast) {
+        loadSubscriptionFeedJob?.cancel()
         if (LocalAudioManager.isLocalPodcast(podcast)) {
             val localPod = localAudioManager.buildLocalPodcast()
             val eps = localAudioManager.getEpisodes()
@@ -2142,24 +2564,38 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
         if (cached != null && cached.episodes.isNotEmpty()) {
             subscriptionEpisodes = cached.episodes
+            if (podcast.artworkUrl.isBlank() && cached.channelImage.isNotBlank()) {
+                subscriptionSelectedPodcast = podcast.copy(artworkUrl = cached.channelImage)
+            }
             recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
             isLoading = false
         } else {
+            subscriptionEpisodes = emptyList()
             isLoading = true
         }
 
-        viewModelScope.launch {
-            val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
+        val targetFeedUrl = podcast.feedUrl
+        loadSubscriptionFeedJob = viewModelScope.launch {
+            val parsed = NetworkModule.fetchPodcastFeed(targetFeedUrl)
             if (parsed != null) {
-                subscriptionEpisodes = parsed.episodes
-                recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
+                recordFeedEpisodesForBadges(targetFeedUrl, parsed.episodes)
                 val updatedPodcast = podcast.copy(
                     title = if (parsed.channelTitle.isNotBlank()) parsed.channelTitle else podcast.title,
                     author = if (parsed.channelAuthor.isNotBlank()) parsed.channelAuthor else podcast.author,
                     artworkUrl = if (parsed.channelImage.isNotBlank()) parsed.channelImage else podcast.artworkUrl,
                     description = if (parsed.channelDescription.isNotBlank()) parsed.channelDescription else podcast.description
                 )
-                subscriptionSelectedPodcast = updatedPodcast
+                if (subscriptionSelectedPodcast?.feedUrl == targetFeedUrl) {
+                    subscriptionEpisodes = parsed.episodes
+                    subscriptionSelectedPodcast = updatedPodcast
+                }
+                if (currentPodcast != null && currentPodcast?.artworkUrl.isNullOrBlank() && updatedPodcast.artworkUrl.isNotBlank() && ArtworkResolver.feedsEquivalent(currentPodcast?.feedUrl, targetFeedUrl)) {
+                    currentPodcast = currentPodcast?.copy(artworkUrl = updatedPodcast.artworkUrl)
+                    val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
+                    statePrefs.edit().putString("last_podcast", appGson.toJson(currentPodcast)).apply()
+                    prepareControllerWithCurrentEpisode()
+                    syncWidget()
+                }
 
                 // If imported from OPML or opened via notification, update missing info
                 if (podcast.title == "Podcast" || podcast.title.isBlank() || podcast.author == "Unknown" || podcast.artworkUrl.isBlank() || podcast.description.isBlank()) {
@@ -2172,7 +2608,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                             if (backup.isNotEmpty()) current = backup.toMutableList()
                         }
                         
-                        val idx = current.indexOfFirst { it.feedUrl == podcast.feedUrl }
+                        val idx = current.indexOfFirst { it.feedUrl == targetFeedUrl }
                         if (idx != -1) {
                             current[idx] = updatedPodcast
                             val updatedJson = Gson().toJson(current)
@@ -2181,10 +2617,12 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                         }
                     }
                 }
-            } else if (cached == null) {
+            } else if (cached == null && subscriptionSelectedPodcast?.feedUrl == targetFeedUrl) {
                 subscriptionEpisodes = emptyList()
             }
-            isLoading = false
+            if (subscriptionSelectedPodcast?.feedUrl == targetFeedUrl) {
+                isLoading = false
+            }
         }
     }
 
@@ -2204,6 +2642,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun loadDiscoverPodcastEpisodes(podcast: Podcast) {
+        loadDiscoverFeedJob?.cancel()
         discoverSelectedPodcast = podcast
         val cached = NetworkModule.getCachedFeed(podcast.feedUrl)
         if (cached != null && cached.episodes.isNotEmpty()) {
@@ -2211,24 +2650,30 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             recordFeedEpisodesForBadges(podcast.feedUrl, cached.episodes)
             isLoading = false
         } else {
+            discoverEpisodes = emptyList()
             isLoading = true
         }
 
-        viewModelScope.launch {
-            val parsed = NetworkModule.fetchPodcastFeed(podcast.feedUrl)
+        val targetFeedUrl = podcast.feedUrl
+        loadDiscoverFeedJob = viewModelScope.launch {
+            val parsed = NetworkModule.fetchPodcastFeed(targetFeedUrl)
             if (parsed != null) {
-                discoverEpisodes = parsed.episodes
-                recordFeedEpisodesForBadges(podcast.feedUrl, parsed.episodes)
-                discoverSelectedPodcast = podcast.copy(
-                    title = if (parsed.channelTitle.isNotBlank()) parsed.channelTitle else podcast.title,
-                    author = if (parsed.channelAuthor.isNotBlank()) parsed.channelAuthor else podcast.author,
-                    artworkUrl = if (parsed.channelImage.isNotBlank()) parsed.channelImage else podcast.artworkUrl,
-                    description = if (parsed.channelDescription.isNotBlank()) parsed.channelDescription else podcast.description
-                )
-            } else if (cached == null) {
+                recordFeedEpisodesForBadges(targetFeedUrl, parsed.episodes)
+                if (discoverSelectedPodcast?.feedUrl == targetFeedUrl) {
+                    discoverEpisodes = parsed.episodes
+                    discoverSelectedPodcast = podcast.copy(
+                        title = if (parsed.channelTitle.isNotBlank()) parsed.channelTitle else podcast.title,
+                        author = if (parsed.channelAuthor.isNotBlank()) parsed.channelAuthor else podcast.author,
+                        artworkUrl = if (parsed.channelImage.isNotBlank()) parsed.channelImage else podcast.artworkUrl,
+                        description = if (parsed.channelDescription.isNotBlank()) parsed.channelDescription else podcast.description
+                    )
+                }
+            } else if (cached == null && discoverSelectedPodcast?.feedUrl == targetFeedUrl) {
                 discoverEpisodes = emptyList()
             }
-            isLoading = false
+            if (discoverSelectedPodcast?.feedUrl == targetFeedUrl) {
+                isLoading = false
+            }
         }
     }
 
@@ -2237,60 +2682,63 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun playEpisode(
-        podcast: Podcast,
+        rawPodcast: Podcast,
         episode: Episode,
         autoPlay: Boolean = false,
         fromQueue: Boolean = false,
         keepPreviousInQueue: Boolean = true
     ) {
+        val podcast = ArtworkResolver.enrichPodcastArtwork(app, rawPodcast, episode)
         val prevPodcast = currentPodcast
         val prevEpisode = currentEpisode
+        val ctrl = controller
+        val wasPrevEnded = ctrl != null &&
+            prevEpisode != null &&
+            ctrl.currentMediaItem?.mediaId == prevEpisode.audioUrl &&
+            (ctrl.playbackState == Player.STATE_ENDED ||
+                (ctrl.duration > 0L && ctrl.currentPosition >= ctrl.duration - 2000L))
 
+        // If user explicitly starts an episode that was in pendingCompletedUrls, clear its pending guard
+        pendingCompletedUrls.remove(episode.audioUrl)
+
+        if (!wasPrevEnded && prevEpisode != null && !pendingCompletedUrls.contains(prevEpisode.audioUrl)) {
+            saveCurrentPlaybackPosition()
+        }
         isPlayingQueue = fromQueue
-        saveCurrentPlaybackPosition()
 
         currentPodcast = podcast
         currentEpisode = episode
 
-        val filteredQueue = upNextQueue.filterNot {
-            it.episode.audioUrl == episode.audioUrl ||
-                (keepPreviousInQueue && prevEpisode != null && it.episode.audioUrl == prevEpisode.audioUrl)
-        }
         val shouldPushPreviousToQueue = keepPreviousInQueue &&
+            !wasPrevEnded &&
             prevPodcast != null &&
             prevEpisode != null &&
             prevEpisode.audioUrl.isNotBlank() &&
             prevEpisode.audioUrl != episode.audioUrl &&
             !playedEpisodes.value.contains(prevEpisode.audioUrl) &&
-            !archivedEpisodes.value.contains(prevEpisode.audioUrl)
+            !archivedEpisodes.value.contains(prevEpisode.audioUrl) &&
+            !pendingCompletedUrls.contains(prevEpisode.audioUrl)
 
-        val updatedQueue = if (shouldPushPreviousToQueue && prevPodcast != null && prevEpisode != null) {
+        val filteredQueue = upNextQueue.filterNot {
+            it.episode.audioUrl == episode.audioUrl ||
+                (shouldPushPreviousToQueue && prevEpisode != null && it.episode.audioUrl == prevEpisode.audioUrl)
+        }
+
+        val rawUpdatedQueue = if (shouldPushPreviousToQueue && prevPodcast != null && prevEpisode != null) {
             listOf(QueueItem(prevPodcast, prevEpisode)) + filteredQueue
         } else {
             filteredQueue
         }
+        val updatedQueue = sanitizeQueue(rawUpdatedQueue, episode.audioUrl)
         if (updatedQueue != upNextQueue) {
             upNextQueue = updatedQueue
             saveUpNextQueue()
         }
 
-        val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
-        statePrefs.edit()
-            .putString("last_podcast", appGson.toJson(podcast))
-            .putString("last_episode", appGson.toJson(episode))
-            .apply()
-        
-        viewModelScope.launch {
-            app.dataStore.edit { prefs ->
-                prefs[stringPreferencesKey("last_podcast")] = appGson.toJson(podcast)
-                prefs[stringPreferencesKey("last_episode")] = appGson.toJson(episode)
-            }
-        }
-
         val metadata = MediaMetadata.Builder()
             .setTitle(episode.title)
             .setArtist(podcast.title)
-            .setArtworkUri(Uri.parse(podcast.artworkUrl))
+            .setArtworkUri(ArtworkResolver.resolveBestArtworkUri(app, podcast, episode))
             .build()
 
         val localUri = downloadManager.getLocalUriIfDownloaded(episode.audioUrl)
@@ -2313,6 +2761,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
         loadChaptersForEpisode(episode)
 
+        val statePrefs = app.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
         statePrefs.edit()
             .putString("last_podcast", appGson.toJson(podcast))
             .putString("last_episode", appGson.toJson(episode))
@@ -2327,15 +2776,14 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
 
         val targetSpeed = getPlaybackSpeedForPodcast(podcast)
+        if (autoPlay) {
+            ensurePlaybackServiceStarted()
+        }
         controller?.apply {
             setPlaybackSpeed(targetSpeed)
-            if (savedPos > 0L) {
-                setMediaItem(item, savedPos)
-            } else {
-                setMediaItem(item, 0L)
-            }
-            prepare()
+            setMediaItems(listOf(item), 0, savedPos.coerceAtLeast(0L))
             if (autoPlay) {
+                prepare()
                 play()
             } else {
                 pause()
@@ -2658,16 +3106,100 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun addToUpNext(podcast: Podcast, episode: Episode) {
-        if (currentEpisode?.audioUrl == episode.audioUrl) return
-        val filtered = upNextQueue.filterNot { it.episode.audioUrl == episode.audioUrl }
+        if (episode.audioUrl.isBlank() || currentEpisode?.audioUrl == episode.audioUrl) return
+        val url = episode.audioUrl
+        pendingCompletedUrls.remove(url)
+        val needsUnmark = playedEpisodes.value.contains(url) || archivedEpisodes.value.contains(url)
+        if (needsUnmark) {
+            viewModelScope.launch {
+                app.dataStore.edit { prefs ->
+                    val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                    val archivedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                    val curPlayed = prefs[playedKey]?.toMutableSet()
+                    if (curPlayed != null && curPlayed.remove(url)) {
+                        prefs[playedKey] = curPlayed
+                    }
+                    val curArchived = prefs[archivedKey]?.toMutableSet()
+                    if (curArchived != null && curArchived.remove(url)) {
+                        prefs[archivedKey] = curArchived
+                    }
+                }
+            }
+        }
+        val filtered = upNextQueue.filterNot { it.episode.audioUrl == url }
         // Place next in line after currently playing episode (at the top of the queue)
-        upNextQueue = listOf(QueueItem(podcast, episode)) + filtered
+        val combined = listOf(QueueItem(podcast, episode)) + filtered
+        upNextQueue = if (needsUnmark) {
+            combined.filter { it.episode.audioUrl.isNotBlank() && it.episode.audioUrl != currentEpisode?.audioUrl }
+                .distinctBy { it.episode.audioUrl.trim() }
+        } else {
+            sanitizeQueue(combined)
+        }
         saveUpNextQueue()
         syncWidget()
     }
 
+    fun addMultipleToUpNext(podcast: Podcast, episodes: List<Episode>) {
+        val activeUrl = currentEpisode?.audioUrl
+        val existingUrls = upNextQueue.map { it.episode.audioUrl }.toSet()
+        val toAdd = episodes
+            .filter { it.audioUrl.isNotBlank() && it.audioUrl != activeUrl && !existingUrls.contains(it.audioUrl) }
+            .distinctBy { it.audioUrl.trim() }
+        if (toAdd.isEmpty()) return
+
+        val addedUrls = toAdd.map { it.audioUrl }.toSet()
+        pendingCompletedUrls.removeAll(addedUrls)
+        val playedSet = playedEpisodes.value
+        val archivedSet = archivedEpisodes.value
+        val urlsToUnmark = addedUrls.filter { playedSet.contains(it) || archivedSet.contains(it) }.toSet()
+        if (urlsToUnmark.isNotEmpty()) {
+            viewModelScope.launch {
+                app.dataStore.edit { prefs ->
+                    val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+                    val archivedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                    val curPlayed = prefs[playedKey]?.toMutableSet()
+                    if (curPlayed != null && curPlayed.removeAll(urlsToUnmark)) {
+                        prefs[playedKey] = curPlayed
+                    }
+                    val curArchived = prefs[archivedKey]?.toMutableSet()
+                    if (curArchived != null && curArchived.removeAll(urlsToUnmark)) {
+                        prefs[archivedKey] = curArchived
+                    }
+                }
+            }
+        }
+
+        val enrichedPodcast = ArtworkResolver.enrichPodcastArtwork(app, podcast, toAdd.firstOrNull())
+        val newItems = toAdd.map { QueueItem(enrichedPodcast, it) }
+        val combined = upNextQueue + newItems
+        upNextQueue = combined
+            .filter { it.episode.audioUrl.isNotBlank() && it.episode.audioUrl != activeUrl }
+            .filterNot { item ->
+                val u = item.episode.audioUrl
+                !addedUrls.contains(u) && (playedSet.contains(u) || archivedSet.contains(u) || pendingCompletedUrls.contains(u))
+            }
+            .distinctBy { it.episode.audioUrl.trim() }
+
+        val json = Gson().toJson(upNextQueue)
+        QueueStorageManager.saveQueueToBackup(app, json)
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                app.dataStore.edit { prefs ->
+                    prefs[stringPreferencesKey("up_next_queue")] = json
+                }
+            } catch (_: Exception) {}
+        }
+        syncWidget()
+    }
+
     fun removeFromUpNext(item: QueueItem) {
-        upNextQueue = upNextQueue - item
+        upNextQueue = upNextQueue.filterNot {
+            if (item.episode.audioUrl.isNotBlank()) {
+                it.episode.audioUrl == item.episode.audioUrl
+            } else {
+                it == item
+            }
+        }
         saveUpNextQueue()
         syncWidget()
     }
@@ -2684,6 +3216,23 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         val item = list.removeAt(fromIndex)
         list.add(toIndex, item)
         upNextQueue = list
+        saveUpNextQueue()
+    }
+
+    fun reorderUpNextItemByKey(fromKey: Any, toKey: Any): Boolean {
+        val list = upNextQueue.toMutableList()
+        val fromIdx = list.indexOfFirst {
+            it.episode.audioUrl.ifBlank { "${it.episode.title}_${it.podcast.feedUrl}" } == fromKey
+        }
+        val toIdx = list.indexOfFirst {
+            it.episode.audioUrl.ifBlank { "${it.episode.title}_${it.podcast.feedUrl}" } == toKey
+        }
+        if (fromIdx == -1 || toIdx == -1 || fromIdx == toIdx) return false
+        val item = list.removeAt(fromIdx)
+        list.add(toIdx, item)
+        upNextQueue = list
+        saveUpNextQueue()
+        return true
     }
 
     fun moveUpNextItem(fromIndex: Int, toIndex: Int) {
@@ -2694,12 +3243,19 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun togglePlayPause() {
         controller?.let {
+            reconcileWithControllerState()
             if (it.isPlaying) {
                 it.pause()
                 saveCurrentPlaybackPosition()
             } else {
-                if (it.currentMediaItem == null && currentEpisode != null && currentPodcast != null) {
+                ensurePlaybackServiceStarted()
+                if ((it.currentMediaItem == null || it.currentMediaItem?.mediaId != currentEpisode?.audioUrl) &&
+                    currentEpisode != null && currentPodcast != null
+                ) {
                     prepareControllerWithCurrentEpisode()
+                }
+                if (it.playbackState == Player.STATE_IDLE || it.playbackState == Player.STATE_ENDED) {
+                    it.prepare()
                 }
                 it.play()
             }
@@ -2770,7 +3326,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     fun seekToChapter(chapter: Chapter) {
         seekToPosition(chapter.startMs)
         if (!isPlaying) {
-            controller?.play()
+            ensurePlaybackServiceStarted()
+            controller?.let {
+                if (it.playbackState == Player.STATE_IDLE) {
+                    it.prepare()
+                }
+                it.play()
+            }
             isPlaying = true
         }
     }
@@ -2933,9 +3495,25 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun toggleArchive(episode: Episode, archive: Boolean, fromPlaybackCompletion: Boolean = false) {
-        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
-        if (archive && !fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
-            advanceOrClearCurrentEpisode()
+        val fallbackPodcastUrl = (if (currentEpisode?.audioUrl == episode.audioUrl) currentPodcast?.feedUrl else null)
+            ?: (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        val activePodcastUrl = GPodderSyncManager.findPodcastUrlForEpisode(app, episode.audioUrl, fallbackPodcastUrl)
+        val epDurationMs = maxOf(
+            parseDurationMs(episode.durationText),
+            if (currentEpisode?.audioUrl == episode.audioUrl && duration > 1L) duration else 0L,
+            GPodderSyncManager.getSavedDurationMs(app, episode.audioUrl)
+        )
+        if (archive) {
+            pendingCompletedUrls.add(episode.audioUrl)
+            if (upNextQueue.any { it.episode.audioUrl == episode.audioUrl }) {
+                upNextQueue = upNextQueue.filterNot { it.episode.audioUrl == episode.audioUrl }
+                saveUpNextQueue()
+            }
+            if (!fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
+                advanceOrClearCurrentEpisode()
+            }
+        } else {
+            pendingCompletedUrls.remove(episode.audioUrl)
         }
         viewModelScope.launch {
             if (archive) {
@@ -2967,7 +3545,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                 episodeUrl = episode.audioUrl,
                 archived = archive,
                 fromPlaybackCompletion = fromPlaybackCompletion,
-                durationMs = parseDurationMs(episode.durationText)
+                durationMs = epDurationMs
             )
         }
     }
@@ -2981,6 +3559,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
                     current.remove(episode.audioUrl)
                 } else {
                     current.add(episode.audioUrl)
+                    pendingCompletedUrls.remove(episode.audioUrl)
                     // If episode was previously archived, unarchive it and mark it as unplayed
                     val archiveKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
                     val archivedSet = prefs[archiveKey]?.toMutableSet()
@@ -2998,10 +3577,64 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    fun pinEpisodes(episodes: List<Episode>) {
+        val urlsToPin = episodes.map { it.audioUrl }.filter { it.isNotBlank() }.toSet()
+        if (urlsToPin.isEmpty()) return
+        pendingCompletedUrls.removeAll(urlsToPin)
+        viewModelScope.launch {
+            app.dataStore.edit { prefs ->
+                val keepKey = androidx.datastore.preferences.core.stringSetPreferencesKey("keep_unarchived_episodes")
+                val archiveKey = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
+                val playedKey = androidx.datastore.preferences.core.stringSetPreferencesKey("played_episodes")
+
+                val currentPinned = prefs[keepKey]?.toMutableSet() ?: mutableSetOf()
+                currentPinned.addAll(urlsToPin)
+                prefs[keepKey] = currentPinned
+
+                val archivedSet = prefs[archiveKey]?.toMutableSet()
+                val unarchivedUrls = mutableSetOf<String>()
+                if (archivedSet != null) {
+                    for (url in urlsToPin) {
+                        if (archivedSet.remove(url)) {
+                            unarchivedUrls.add(url)
+                        }
+                    }
+                    if (unarchivedUrls.isNotEmpty()) {
+                        prefs[archiveKey] = archivedSet
+                        val playedSet = prefs[playedKey]?.toMutableSet()
+                        if (playedSet != null && playedSet.removeAll(unarchivedUrls)) {
+                            prefs[playedKey] = playedSet
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun unpinEpisodes(episodes: List<Episode>) {
+        val urlsToUnpin = episodes.map { it.audioUrl }.filter { it.isNotBlank() }.toSet()
+        if (urlsToUnpin.isEmpty()) return
+        viewModelScope.launch {
+            app.dataStore.edit { prefs ->
+                val keepKey = androidx.datastore.preferences.core.stringSetPreferencesKey("keep_unarchived_episodes")
+                val currentPinned = prefs[keepKey]?.toMutableSet() ?: return@edit
+                if (currentPinned.removeAll(urlsToUnpin)) {
+                    prefs[keepKey] = currentPinned
+                }
+            }
+        }
+    }
+
     fun archiveAllEpisodes(episodes: List<Episode>) {
         val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
         val pinned = keepUnarchivedEpisodes.value
         val unpinnedEpisodes = episodes.filter { !pinned.contains(it.audioUrl) }
+        val unpinnedUrls = unpinnedEpisodes.map { it.audioUrl }.filter { it.isNotBlank() }.toSet()
+        pendingCompletedUrls.addAll(unpinnedUrls)
+        if (upNextQueue.any { unpinnedUrls.contains(it.episode.audioUrl) }) {
+            upNextQueue = upNextQueue.filterNot { unpinnedUrls.contains(it.episode.audioUrl) }
+            saveUpNextQueue()
+        }
         if (currentEpisode != null && unpinnedEpisodes.any { it.audioUrl == currentEpisode?.audioUrl }) {
             advanceOrClearCurrentEpisode()
         }
@@ -3023,12 +3656,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             }
             unpinnedEpisodes.forEach { ep ->
                 if (ep.audioUrl.isNotBlank()) {
+                    val resolvedFeed = GPodderSyncManager.findPodcastUrlForEpisode(app, ep.audioUrl, activePodcastUrl)
                     GPodderSyncManager.onEpisodeArchiveStateChanged(
                         context = app,
-                        podcastUrl = activePodcastUrl,
+                        podcastUrl = resolvedFeed,
                         episodeUrl = ep.audioUrl,
                         archived = true,
-                        durationMs = parseDurationMs(ep.durationText)
+                        durationMs = maxOf(parseDurationMs(ep.durationText), GPodderSyncManager.getSavedDurationMs(app, ep.audioUrl))
                     )
                 }
             }
@@ -3037,6 +3671,7 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
 
     fun unarchiveAllEpisodes(episodes: List<Episode>) {
         val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        episodes.forEach { pendingCompletedUrls.remove(it.audioUrl) }
         viewModelScope.launch {
             app.dataStore.edit { prefs ->
                 val key = androidx.datastore.preferences.core.stringSetPreferencesKey("archived_episodes")
@@ -3052,12 +3687,13 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
             }
             episodes.forEach { ep ->
                 if (ep.audioUrl.isNotBlank()) {
+                    val resolvedFeed = GPodderSyncManager.findPodcastUrlForEpisode(app, ep.audioUrl, activePodcastUrl)
                     GPodderSyncManager.onEpisodeArchiveStateChanged(
                         context = app,
-                        podcastUrl = activePodcastUrl,
+                        podcastUrl = resolvedFeed,
                         episodeUrl = ep.audioUrl,
                         archived = false,
-                        durationMs = parseDurationMs(ep.durationText)
+                        durationMs = maxOf(parseDurationMs(ep.durationText), GPodderSyncManager.getSavedDurationMs(app, ep.audioUrl))
                     )
                 }
             }
@@ -3065,10 +3701,27 @@ class PodcastViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun markEpisodePlayed(episode: Episode, played: Boolean, fromPlaybackCompletion: Boolean = false) {
-        val activePodcastUrl = (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
-        val epDurationMs = parseDurationMs(episode.durationText).let { if (it > 0L) it else if (currentEpisode?.audioUrl == episode.audioUrl && duration > 1L) duration else 0L }
-        if (played && !fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
-            advanceOrClearCurrentEpisode()
+        val fallbackPodcastUrl = (if (currentEpisode?.audioUrl == episode.audioUrl) currentPodcast?.feedUrl else null)
+            ?: (subscriptionSelectedPodcast ?: discoverSelectedPodcast ?: currentPodcast)?.feedUrl
+        val activePodcastUrl = GPodderSyncManager.findPodcastUrlForEpisode(app, episode.audioUrl, fallbackPodcastUrl)
+        val epDurationMs = maxOf(
+            parseDurationMs(episode.durationText),
+            if (currentEpisode?.audioUrl == episode.audioUrl && duration > 1L) duration else 0L,
+            GPodderSyncManager.getSavedDurationMs(app, episode.audioUrl)
+        )
+        if (played) {
+            pendingCompletedUrls.add(episode.audioUrl)
+            val posPrefs = app.getSharedPreferences("expressopod_positions", Context.MODE_PRIVATE)
+            posPrefs.edit().remove(episode.audioUrl).apply()
+            if (upNextQueue.any { it.episode.audioUrl == episode.audioUrl }) {
+                upNextQueue = upNextQueue.filterNot { it.episode.audioUrl == episode.audioUrl }
+                saveUpNextQueue()
+            }
+            if (!fromPlaybackCompletion && currentEpisode?.audioUrl == episode.audioUrl) {
+                advanceOrClearCurrentEpisode()
+            }
+        } else {
+            pendingCompletedUrls.remove(episode.audioUrl)
         }
         viewModelScope.launch {
             app.dataStore.edit { prefs ->
@@ -3490,22 +4143,73 @@ class MainActivity : ComponentActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
                 "com.rpmtech.expressopod.ACTION_QUEUE_CHANGED" -> {
+                    val queueEmpty = intent.getBooleanExtra("queue_empty", false)
+                    val fromCompletion = intent.getBooleanExtra("from_completion", false)
                     val playedUrl = intent.getStringExtra("played_url")
-                    if (playedUrl != null) {
-                        viewModelRef?.let { vm ->
+                    val endedUrl = intent.getStringExtra("ended_url")
+                    viewModelRef?.let { vm ->
+                        if (queueEmpty) {
+                            val endedPod = vm.currentPodcast
+                            vm.currentPodcast = null
+                            vm.currentEpisode = null
+                            vm.isPlaying = false
+                            vm.currentPosition = 0L
+                            vm.duration = 1L
+                            vm.currentChapters = emptyList()
+                            vm.upNextQueue = emptyList()
+                            if (fromCompletion) {
+                                vm.positionsVersion++
+                                if (vm.isPlayingQueue) {
+                                    vm.isPlayingQueue = false
+                                    vm.playbackNavTarget = PodcastViewModel.PlaybackNavTarget.SubscriptionsHome
+                                } else {
+                                    if (vm.discoverSelectedPodcast == null && vm.subscriptionSelectedPodcast == null && endedPod != null) {
+                                        vm.subscriptionSelectedPodcast = endedPod
+                                        vm.loadSubscriptionPodcastEpisodes(endedPod)
+                                    }
+                                    vm.playbackNavTarget = PodcastViewModel.PlaybackNavTarget.EpisodeList
+                                }
+                            }
+                            vm.syncWidget()
+                        } else if (playedUrl != null) {
                             val statePrefs = context?.getSharedPreferences("expressopod_state", Context.MODE_PRIVATE)
-                            val podJson = statePrefs?.getString("last_podcast", null)
-                            val epJson = statePrefs?.getString("last_episode", null)
+                            val podJson = intent.getStringExtra("new_podcast_json")
+                                ?: statePrefs?.getString("last_podcast", null)
+                            val epJson = intent.getStringExtra("new_episode_json")
+                                ?: statePrefs?.getString("last_episode", null)
+                            val newPos = intent.getLongExtra("new_position", -1L)
+                            var adoptedEp: Episode? = null
                             if (podJson != null) {
                                 try { vm.currentPodcast = Gson().fromJson(podJson, Podcast::class.java) } catch (_: Exception) {}
+                            } else {
+                                vm.currentPodcast = null
                             }
                             if (epJson != null) {
-                                try { vm.currentEpisode = Gson().fromJson(epJson, Episode::class.java) } catch (_: Exception) {}
+                                try {
+                                    adoptedEp = Gson().fromJson(epJson, Episode::class.java)
+                                    vm.currentEpisode = adoptedEp
+                                } catch (_: Exception) {}
+                            } else {
+                                vm.currentEpisode = null
+                            }
+                            if (newPos >= 0L) {
+                                vm.currentPosition = newPos
+                            }
+                            adoptedEp?.let { ep ->
+                                val epDurMs = parseDurationMs(ep.durationText)
+                                if (epDurMs > 0L) {
+                                    vm.duration = epDurMs
+                                }
+                                vm.loadChaptersForEpisode(ep)
+                            }
+                            if (fromCompletion) {
+                                vm.isPlayingQueue = true
+                                vm.positionsVersion++
                             }
                             if (context != null) {
-                                vm.upNextQueue = QueueStorageManager.loadQueueFromBackup(context)
-                                    .filterNot { it.episode.audioUrl == vm.currentEpisode?.audioUrl }
-                                vm.saveUpNextQueue()
+                                val loaded = QueueStorageManager.loadQueueFromBackup(context)
+                                    .filterNot { it.episode.audioUrl == playedUrl || (endedUrl != null && it.episode.audioUrl == endedUrl) }
+                                vm.upNextQueue = vm.sanitizeQueue(loaded, playedUrl)
                             } else {
                                 vm.removeFromUpNextByUrl(playedUrl)
                             }
@@ -3516,10 +4220,16 @@ class MainActivity : ComponentActivity() {
                 "com.rpmtech.expressopod.ACTION_PLAYBACK_STATE_CHANGED" -> {
                     val isPlaying = intent.getBooleanExtra("is_playing", false)
                     val pos = intent.getLongExtra("position", -1L)
+                    val mediaId = intent.getStringExtra("media_id")
                     viewModelRef?.let { vm ->
-                        vm.isPlaying = isPlaying
-                        if (pos >= 0L) {
-                            vm.currentPosition = pos
+                        if (mediaId != null && mediaId != vm.currentEpisode?.audioUrl) {
+                            vm.reconcileWithControllerState()
+                        }
+                        if (mediaId == null || mediaId == vm.currentEpisode?.audioUrl) {
+                            vm.isPlaying = isPlaying
+                            if (pos >= 0L) {
+                                vm.currentPosition = pos
+                            }
                         }
                         vm.syncPlaybackState()
                     }
@@ -3740,7 +4450,8 @@ fun ExpressivePodcastTheme(themeConfig: Int = 0, content: @Composable () -> Unit
     }
 
     MaterialTheme(
-        colorScheme = colorScheme
+        colorScheme = colorScheme,
+        typography = com.rpmtech.expressopod.ui.theme.Typography
     ) {
         Surface(
             modifier = Modifier.fillMaxSize(),
@@ -3795,6 +4506,73 @@ fun rememberSubtleHaptic(): () -> Unit {
     return remember(view) {
         { view.performSubtleHaptic() }
     }
+}
+
+@Composable
+fun AutoFitSingleLineText(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = LocalTextStyle.current,
+    fontWeight: FontWeight? = null,
+    color: Color = Color.Unspecified,
+    textAlign: TextAlign? = null,
+    minFontSize: TextUnit = 9.sp
+) {
+    val screenWidthDp = LocalConfiguration.current.screenWidthDp
+    val baseFontSize = if (style.fontSize != TextUnit.Unspecified) style.fontSize else 16.sp
+    val baseLineHeight = style.lineHeight
+    var scaledFontSize by remember(text, baseFontSize, screenWidthDp) { mutableStateOf(baseFontSize) }
+    var readyToDraw by remember(text, baseFontSize, screenWidthDp) { mutableStateOf(false) }
+
+    val scaledLineHeight = if (baseLineHeight != TextUnit.Unspecified && baseFontSize.value > 0f) {
+        (baseLineHeight.value * (scaledFontSize.value / baseFontSize.value)).sp
+    } else {
+        baseLineHeight
+    }
+
+    Text(
+        text = text,
+        modifier = modifier.drawWithContent {
+            if (readyToDraw) {
+                drawContent()
+            }
+        },
+        style = style.copy(
+            fontSize = scaledFontSize,
+            lineHeight = scaledLineHeight,
+            lineBreak = LineBreak.Heading,
+            hyphens = Hyphens.None
+        ),
+        fontWeight = fontWeight,
+        color = color,
+        textAlign = textAlign,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Clip,
+        onTextLayout = { result ->
+            val intrinsicW = result.multiParagraph.maxIntrinsicWidth
+            val lineW = if (result.lineCount > 0) {
+                (result.getLineRight(0) - result.getLineLeft(0)).coerceAtLeast(intrinsicW)
+            } else {
+                intrinsicW
+            }
+            if ((result.didOverflowWidth || lineW > result.size.width + 0.5f) &&
+                result.size.width > 0 &&
+                scaledFontSize > minFontSize
+            ) {
+                val ratio = (result.size.width.toFloat() / lineW) * 0.97f
+                val nextValue = (scaledFontSize.value * ratio.coerceIn(0.45f, 0.96f))
+                    .coerceAtLeast(minFontSize.value)
+                if (nextValue < scaledFontSize.value - 0.1f) {
+                    scaledFontSize = nextValue.sp
+                } else {
+                    readyToDraw = true
+                }
+            } else {
+                readyToDraw = true
+            }
+        }
+    )
 }
 
 enum class SettingsCategory(
@@ -3951,10 +4729,10 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel(), themeConfig: Int = vm.c
                                 modifier = Modifier.fillMaxSize()
                             )
                         }
-                        Text(
-                            headerTitle,
+                        AutoFitSingleLineText(
+                            text = headerTitle,
                             style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Black
+                            fontWeight = FontWeight.Bold
                         )
                     }
                 },
@@ -4017,7 +4795,7 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel(), themeConfig: Int = vm.c
                                                 Text(
                                                     text = if (count > 99) "99+" else "$count",
                                                     style = MaterialTheme.typography.labelSmall.copy(
-                                                        fontWeight = FontWeight.ExtraBold,
+                                                        fontWeight = FontWeight.Bold,
                                                         fontSize = 10.sp,
                                                         lineHeight = 12.sp
                                                     ),
@@ -4169,11 +4947,8 @@ fun PodcastAppScreen(vm: PodcastViewModel = viewModel(), themeConfig: Int = vm.c
                                     )
                                 },
                                 label = {
-                                    Text(
+                                    AutoFitSingleLineText(
                                         text = label,
-                                        maxLines = 1,
-                                        softWrap = false,
-                                        overflow = TextOverflow.Ellipsis,
                                         color = itemTextColor,
                                         style = tabTextStyle.copy(
                                             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
@@ -4524,7 +5299,7 @@ fun SettingsScreen(vm: PodcastViewModel, themeConfig: Int = vm.currentThemeConfi
                         ) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to Settings")
                         }
-                        Spacer(Modifier.width(12.dp))
+                        Spacer(Modifier.width(10.dp))
                         Box(
                             modifier = Modifier
                                 .size(34.dp)
@@ -4540,13 +5315,12 @@ fun SettingsScreen(vm: PodcastViewModel, themeConfig: Int = vm.currentThemeConfi
                             )
                         }
                         Spacer(Modifier.width(10.dp))
-                        Text(
+                        AutoFitSingleLineText(
                             text = category.title,
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            modifier = Modifier.weight(1f)
                         )
                     }
 
@@ -4741,8 +5515,8 @@ private fun SettingsCategoryItemCard(
                     )
                 }
                 Spacer(modifier = Modifier.width(14.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = category.title,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
@@ -4855,11 +5629,8 @@ private fun SettingOptionChip(
                 )
                 Spacer(Modifier.width(3.dp))
             }
-            Text(
+            AutoFitSingleLineText(
                 text = label,
-                maxLines = 1,
-                softWrap = false,
-                overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.labelMedium.copy(
                     fontSize = chipFontSize,
                     lineBreak = LineBreak.Heading,
@@ -4886,8 +5657,8 @@ private fun ThemeSettingsCard(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Appearance & Theme",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -4955,8 +5726,8 @@ private fun KeepScreenOnCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Keep Screen On",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5009,8 +5780,8 @@ private fun ShowMiniPlayerCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Show Mini Player",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5063,8 +5834,8 @@ private fun ShowRemainingTimeCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Show Remaining Time",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5117,8 +5888,8 @@ private fun StreamingCacheCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Cache Playing Episode",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5142,6 +5913,25 @@ private fun StreamingCacheCard(
     }
 }
 
+private fun globalSpeedToSliderFraction(speed: Float): Float {
+    val clamped = speed.coerceIn(PlaybackSpeedManager.MIN_SPEED, PlaybackSpeedManager.MAX_SPEED)
+    return if (clamped <= 1.0f) {
+        ((clamped - PlaybackSpeedManager.MIN_SPEED) / (1.0f - PlaybackSpeedManager.MIN_SPEED)) * 0.5f
+    } else {
+        0.5f + ((clamped - 1.0f) / (PlaybackSpeedManager.MAX_SPEED - 1.0f)) * 0.5f
+    }.coerceIn(0f, 1f)
+}
+
+private fun sliderFractionToGlobalSpeed(fraction: Float): Float {
+    val f = fraction.coerceIn(0f, 1f)
+    val raw = if (f <= 0.5f) {
+        PlaybackSpeedManager.MIN_SPEED + (f / 0.5f) * (1.0f - PlaybackSpeedManager.MIN_SPEED)
+    } else {
+        1.0f + ((f - 0.5f) / 0.5f) * (PlaybackSpeedManager.MAX_SPEED - 1.0f)
+    }
+    return PlaybackSpeedManager.clampSpeed(raw)
+}
+
 @Composable
 private fun GlobalPlaybackSpeedCard(
     globalSpeed: Float,
@@ -5149,7 +5939,16 @@ private fun GlobalPlaybackSpeedCard(
 ) {
     val subtleHaptic = rememberSubtleHaptic()
     val isCustomGlobalSpeed = kotlin.math.abs(globalSpeed - 1.0f) >= 0.05f
-    var lastHapticStep by remember { mutableIntStateOf((globalSpeed * 20f).toInt()) }
+    var lastHapticStep by remember { mutableIntStateOf(kotlin.math.round(globalSpeed * 10f).toInt()) }
+    var isDragging by remember { mutableStateOf(false) }
+    var dragFraction by remember { mutableFloatStateOf(globalSpeedToSliderFraction(globalSpeed)) }
+
+    LaunchedEffect(globalSpeed, isDragging) {
+        if (!isDragging) {
+            dragFraction = globalSpeedToSliderFraction(globalSpeed)
+            lastHapticStep = kotlin.math.round(globalSpeed * 10f).toInt()
+        }
+    }
 
     SettingCard {
         Row(
@@ -5168,8 +5967,8 @@ private fun GlobalPlaybackSpeedCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Global Playback Speed",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5182,80 +5981,91 @@ private fun GlobalPlaybackSpeedCard(
                 }
             }
             Spacer(Modifier.width(8.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(10.dp),
-                    color = MaterialTheme.colorScheme.primaryContainer
-                ) {
-                    Text(
-                        text = PlaybackSpeedManager.formatSpeed(globalSpeed),
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                    )
-                }
-                if (isCustomGlobalSpeed) {
-                    Surface(
-                        shape = RoundedCornerShape(10.dp),
-                        color = MaterialTheme.colorScheme.secondaryContainer,
-                        modifier = Modifier.clickable {
-                            subtleHaptic()
-                            onUpdateGlobalSpeed(1.0f)
-                        }
-                    ) {
-                        Text(
-                            text = "1.0x",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onSecondaryContainer,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-                        )
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MaterialTheme.colorScheme.primaryContainer,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable(enabled = isCustomGlobalSpeed) {
+                        subtleHaptic()
+                        isDragging = false
+                        onUpdateGlobalSpeed(1.0f)
                     }
-                }
+            ) {
+                Text(
+                    text = PlaybackSpeedManager.formatSpeed(globalSpeed),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                )
             }
         }
 
         Spacer(Modifier.height(10.dp))
 
         Slider(
-            value = globalSpeed,
-            onValueChange = { raw ->
-                val step = kotlin.math.round(raw * 20f).toInt()
+            value = if (isDragging) dragFraction else globalSpeedToSliderFraction(globalSpeed),
+            onValueChange = { rawFraction ->
+                isDragging = true
+                dragFraction = rawFraction
+                val snapped = sliderFractionToGlobalSpeed(rawFraction)
+                val step = kotlin.math.round(snapped * 10f).toInt()
                 if (step != lastHapticStep) {
                     lastHapticStep = step
                     subtleHaptic()
                 }
-                onUpdateGlobalSpeed(raw)
+                onUpdateGlobalSpeed(snapped)
             },
-            valueRange = PlaybackSpeedManager.MIN_SPEED..PlaybackSpeedManager.MAX_SPEED,
+            onValueChangeFinished = {
+                isDragging = false
+                dragFraction = globalSpeedToSliderFraction(globalSpeed)
+            },
+            valueRange = 0f..1f,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(32.dp)
         )
 
-        Row(
+        androidx.compose.ui.layout.Layout(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text(
-                text = "0.5x",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                text = "1.0x",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Text(
-                text = "5.0x",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            content = {
+                Text(
+                    text = "0.5x",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = "1.0x",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable(enabled = isCustomGlobalSpeed) {
+                        subtleHaptic()
+                        isDragging = false
+                        onUpdateGlobalSpeed(1.0f)
+                    }
+                )
+                Text(
+                    text = "5.0x",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        ) { measurables, constraints ->
+            val looseConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+            val minPlaceable = measurables[0].measure(looseConstraints)
+            val oneXPlaceable = measurables[1].measure(looseConstraints)
+            val maxPlaceable = measurables[2].measure(looseConstraints)
+
+            val width = constraints.maxWidth
+            val height = maxOf(minPlaceable.height, oneXPlaceable.height, maxPlaceable.height)
+            val oneXLeft = ((width - oneXPlaceable.width) / 2).coerceAtLeast(0)
+
+            layout(width, height) {
+                minPlaceable.placeRelative(0, (height - minPlaceable.height) / 2)
+                oneXPlaceable.placeRelative(oneXLeft, (height - oneXPlaceable.height) / 2)
+                maxPlaceable.placeRelative((width - maxPlaceable.width).coerceAtLeast(0), (height - maxPlaceable.height) / 2)
+            }
         }
     }
 }
@@ -5279,8 +6089,8 @@ private fun SkipPresetsCard(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Skip Presets",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -5294,7 +6104,7 @@ private fun SkipPresetsCard(
         }
         Spacer(Modifier.height(14.dp))
 
-        Text(
+        AutoFitSingleLineText(
             text = "Rewind interval (${rewindPreset}s)",
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.SemiBold,
@@ -5322,7 +6132,7 @@ private fun SkipPresetsCard(
 
         Spacer(Modifier.height(12.dp))
 
-        Text(
+        AutoFitSingleLineText(
             text = "Fast Forward interval (${forwardPreset}s)",
             style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.SemiBold,
@@ -5385,8 +6195,8 @@ private fun NotificationSettingsCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "New Episode Alerts",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5426,11 +6236,12 @@ private fun NotificationSettingsCard(
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text(
-                            "Background Sync Active",
+                        AutoFitSingleLineText(
+                            text = "Background Sync Active",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.primary
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.weight(1f)
                         )
                     }
                     Spacer(Modifier.height(4.dp))
@@ -5449,7 +6260,7 @@ private fun NotificationSettingsCard(
                     ) {
                         Icon(Icons.Default.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(8.dp))
-                        Text("Check Subscriptions Now")
+                        AutoFitSingleLineText("Check Subscriptions Now", style = MaterialTheme.typography.labelLarge)
                     }
                 }
             }
@@ -5472,7 +6283,7 @@ private fun NotificationSettingsCard(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text(
+                    AutoFitSingleLineText(
                         text = "Episode Notifications",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5526,7 +6337,7 @@ private fun NotificationSettingsCard(
                             modifier = Modifier.weight(1f),
                             enabled = activeCount < totalCount
                         ) {
-                            Text("Select All", style = MaterialTheme.typography.labelMedium)
+                            AutoFitSingleLineText("Select All", style = MaterialTheme.typography.labelMedium)
                         }
                         OutlinedButton(
                             onClick = {
@@ -5536,7 +6347,7 @@ private fun NotificationSettingsCard(
                             modifier = Modifier.weight(1f),
                             enabled = activeCount > 0
                         ) {
-                            Text("Mute All", style = MaterialTheme.typography.labelMedium)
+                            AutoFitSingleLineText("Mute All", style = MaterialTheme.typography.labelMedium)
                         }
                     }
 
@@ -5574,12 +6385,10 @@ private fun NotificationSettingsCard(
                                     )
                                     Spacer(Modifier.width(10.dp))
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(
+                                        AutoFitSingleLineText(
                                             text = podcast.title,
                                             style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.SemiBold,
-                                            maxLines = 1,
-                                            overflow = TextOverflow.Ellipsis
+                                            fontWeight = FontWeight.SemiBold
                                         )
                                         Text(
                                             text = if (isNotified) "Notifying" else "Muted",
@@ -5622,8 +6431,8 @@ private fun EpisodeBadgesSettingsCard(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Subscription Episode Badges",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -5669,8 +6478,8 @@ private fun EpisodeBadgesSettingsCard(
                     }
                 }
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Unplayed Episodes Badge",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold
@@ -5724,8 +6533,8 @@ private fun EpisodeBadgesSettingsCard(
                     }
                 }
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Downloaded Episodes Badge",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold
@@ -5764,8 +6573,8 @@ private fun OpmlSubscriptionsCard(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "OPML Subscriptions",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -5791,7 +6600,7 @@ private fun OpmlSubscriptionsCard(
             ) {
                 Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("Import OPML")
+                AutoFitSingleLineText("Import OPML", style = MaterialTheme.typography.labelLarge)
             }
             FilledTonalButton(
                 onClick = {
@@ -5802,7 +6611,7 @@ private fun OpmlSubscriptionsCard(
             ) {
                 Icon(Icons.Default.Upload, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("Export OPML")
+                AutoFitSingleLineText("Export OPML", style = MaterialTheme.typography.labelLarge)
             }
         }
     }
@@ -5887,8 +6696,8 @@ private fun GPodderSyncCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "gPodder Sync",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -5938,7 +6747,7 @@ private fun GPodderSyncCard(
         Spacer(Modifier.height(14.dp))
 
         // Server Service Type Selector (Standard gPodder vs Nextcloud)
-        Text(
+        AutoFitSingleLineText(
             text = "Sync Service",
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.Bold
@@ -6178,11 +6987,11 @@ private fun GPodderSyncCard(
                         color = MaterialTheme.colorScheme.onSecondaryContainer
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Testing...")
+                    AutoFitSingleLineText("Testing...", style = MaterialTheme.typography.labelLarge)
                 } else {
                     Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text("Test Connection")
+                    AutoFitSingleLineText("Test Connection", style = MaterialTheme.typography.labelLarge)
                 }
             }
 
@@ -6208,7 +7017,7 @@ private fun GPodderSyncCard(
                 },
                 modifier = Modifier.weight(0.7f)
             ) {
-                Text("Save")
+                AutoFitSingleLineText("Save", style = MaterialTheme.typography.labelLarge)
             }
         }
 
@@ -6293,8 +7102,8 @@ private fun GPodderSyncCard(
                 modifier = Modifier.size(18.dp)
             )
             Spacer(Modifier.width(8.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Sync Frequency",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
@@ -6350,7 +7159,7 @@ private fun GPodderSyncCard(
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Column(modifier = Modifier.weight(1f)) {
-                Text(
+                AutoFitSingleLineText(
                     text = "Sync Status",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
@@ -6413,7 +7222,7 @@ private fun GPodderSyncCard(
                         color = MaterialTheme.colorScheme.onPrimary
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Syncing...")
+                    AutoFitSingleLineText("Syncing...", style = MaterialTheme.typography.labelLarge)
                 } else {
                     Icon(
                         Icons.Default.Sync,
@@ -6421,7 +7230,7 @@ private fun GPodderSyncCard(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(Modifier.width(6.dp))
-                    Text("Sync Now")
+                    AutoFitSingleLineText("Sync Now", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -6449,7 +7258,7 @@ private fun GPodderSyncCard(
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(Modifier.width(6.dp))
-                Text("Disconnect gPodder Account")
+                AutoFitSingleLineText("Disconnect gPodder Account", style = MaterialTheme.typography.labelLarge)
             }
         }
     }
@@ -6484,8 +7293,8 @@ private fun AutoArchiveCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Auto-Archive Finished Episodes",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -6575,8 +7384,8 @@ private fun DownloadsSettingsCard(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = "Downloaded Episodes",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -6605,7 +7414,7 @@ private fun DownloadsSettingsCard(
                     modifier = Modifier.size(18.dp)
                 )
                 Spacer(Modifier.width(6.dp))
-                Text("Remove All")
+                AutoFitSingleLineText("Remove All", style = MaterialTheme.typography.labelLarge)
             }
         }
     }
@@ -6821,8 +7630,8 @@ private fun LocalAudioFilesSettingsSection(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Title in Subscriptions",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -6893,7 +7702,7 @@ private fun LocalAudioFilesSettingsSection(
             ) {
                 Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(6.dp))
-                Text("Save Title")
+                AutoFitSingleLineText("Save Title", style = MaterialTheme.typography.labelLarge)
             }
 
             if (subscriptionTitle != LocalAudioManager.DEFAULT_SUBSCRIPTION_TITLE) {
@@ -6907,7 +7716,7 @@ private fun LocalAudioFilesSettingsSection(
                     },
                     shape = RoundedCornerShape(14.dp)
                 ) {
-                    Text("Reset")
+                    AutoFitSingleLineText("Reset", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -6923,8 +7732,8 @@ private fun LocalAudioFilesSettingsSection(
                 modifier = Modifier.size(24.dp)
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
+            Column(modifier = Modifier.weight(1f)) {
+                AutoFitSingleLineText(
                     text = "Import Audio Files",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
@@ -6955,11 +7764,11 @@ private fun LocalAudioFilesSettingsSection(
                     color = MaterialTheme.colorScheme.onPrimary
                 )
                 Spacer(Modifier.width(8.dp))
-                Text("Importing Audio Files...")
+                AutoFitSingleLineText("Importing Audio Files...", style = MaterialTheme.typography.labelLarge)
             } else {
                 Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(20.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Add Audio Files", fontWeight = FontWeight.Bold)
+                AutoFitSingleLineText("Add Audio Files", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
             }
         }
 
@@ -6975,7 +7784,10 @@ private fun LocalAudioFilesSettingsSection(
             ) {
                 Icon(Icons.Default.Subscriptions, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
-                Text("Open \"$subscriptionTitle\" in Subscriptions")
+                AutoFitSingleLineText(
+                    text = "Open \"$subscriptionTitle\" in Subscriptions",
+                    style = MaterialTheme.typography.labelLarge
+                )
             }
         }
     }
@@ -6998,8 +7810,8 @@ private fun LocalAudioFilesSettingsSection(
                     modifier = Modifier.size(24.dp)
                 )
                 Spacer(Modifier.width(10.dp))
-                Column {
-                    Text(
+                Column(modifier = Modifier.weight(1f)) {
+                    AutoFitSingleLineText(
                         text = if (localFiles.isNotEmpty()) "Added Audio Files (${localFiles.size})" else "Added Audio Files",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
@@ -7033,7 +7845,7 @@ private fun LocalAudioFilesSettingsSection(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(Modifier.width(4.dp))
-                    Text("Delete All")
+                    AutoFitSingleLineText("Delete All", style = MaterialTheme.typography.labelLarge)
                 }
             }
         }
@@ -7230,10 +8042,11 @@ fun AboutScreen(onBack: () -> Unit) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Spacer(Modifier.width(12.dp))
-            Text(
+            AutoFitSingleLineText(
                 text = "About ExpressoPod",
                 style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.weight(1f)
             )
         }
 
@@ -7268,7 +8081,7 @@ fun AboutScreen(onBack: () -> Unit) {
                 Text(
                     text = "ExpressoPod",
                     style = MaterialTheme.typography.headlineMedium,
-                    fontWeight = FontWeight.ExtraBold,
+                    fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSurface
                 )
 
@@ -7706,12 +8519,18 @@ fun PodcastOptionsMenu(
     activeDownloads: Map<String, Float>,
     archivedEpisodes: Set<String>,
     keepUnarchivedEpisodes: Set<String> = emptySet(),
+    autoArchiveEnabled: Boolean = false,
+    upNextUrls: Set<String> = emptySet(),
+    currentEpisodeUrl: String? = null,
     selectedEpisodeUrls: Set<String> = emptySet(),
     showArchived: Boolean = false,
     filterMode: Int = 0,
     onSelectAll: () -> Unit = {},
     onClearSelection: () -> Unit = {},
     onDownloadAll: (List<Episode>) -> Unit,
+    onAddToUpNext: (List<Episode>) -> Unit = {},
+    onPinEpisodes: (List<Episode>) -> Unit = {},
+    onUnpinEpisodes: (List<Episode>) -> Unit = {},
     onArchiveAll: (List<Episode>) -> Unit,
     onUnarchiveAll: (List<Episode>) -> Unit = {},
     onOpenLocalAudioSettings: () -> Unit = {}
@@ -7737,11 +8556,21 @@ fun PodcastOptionsMenu(
     val selectedArchivedCount = candidateEpisodes.count { archivedEpisodes.contains(it.audioUrl) }
     val selectedUnarchivedCount = candidateEpisodes.size - selectedArchivedCount
 
-    val isUnarchive = if (hasSelected) {
-        selectedArchivedCount > 0 && (selectedUnarchivedCount == 0 || showArchived || filterMode == 3)
+    val isArchivedShown = filterMode == 3 || (filterMode == 0 && showArchived)
+    val showUnarchiveOption = if (hasSelected) {
+        isArchivedShown && selectedArchivedCount > 0
     } else {
-        showArchived || filterMode == 3
+        isArchivedShown
     }
+    val showArchiveOption = if (hasSelected) {
+        filterMode != 3 && selectedUnarchivedCount > 0
+    } else {
+        filterMode != 3
+    }
+
+    val pinnableCandidates = candidateEpisodes.filter { it.audioUrl.isNotBlank() }
+    val allCandidatesPinned = pinnableCandidates.isNotEmpty() &&
+        pinnableCandidates.all { keepUnarchivedEpisodes.contains(it.audioUrl) }
 
     Box {
         IconButton(onClick = {
@@ -7812,7 +8641,92 @@ fun PodcastOptionsMenu(
                     }
                 )
             }
-            if (isUnarchive) {
+            DropdownMenuItem(
+                text = { Text(if (hasSelected) "Add selected to Up Next" else "Add all to Up Next") },
+                leadingIcon = {
+                    Icon(Icons.Default.Queue, contentDescription = null)
+                },
+                onClick = {
+                    subtleHaptic()
+                    expanded = false
+                    val toQueue = candidateEpisodes.filter { ep ->
+                        ep.audioUrl.isNotBlank() &&
+                            ep.audioUrl != currentEpisodeUrl &&
+                            !upNextUrls.contains(ep.audioUrl)
+                    }
+                    if (toQueue.isNotEmpty()) {
+                        onAddToUpNext(toQueue)
+                        Toast.makeText(
+                            context,
+                            if (hasSelected) "Added ${toQueue.size} selected episode(s) to Up Next" else "Added ${toQueue.size} episode(s) to Up Next",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        onClearSelection()
+                    } else {
+                        Toast.makeText(
+                            context,
+                            if (hasSelected) "Selected episode(s) are already in Up Next" else "All episodes are already in Up Next",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        onClearSelection()
+                    }
+                }
+            )
+            if (autoArchiveEnabled) {
+                if (allCandidatesPinned) {
+                    DropdownMenuItem(
+                        text = { Text(if (hasSelected) "Unpin selected" else "Unpin all") },
+                        leadingIcon = {
+                            Icon(Icons.Outlined.PushPin, contentDescription = null)
+                        },
+                        onClick = {
+                            subtleHaptic()
+                            expanded = false
+                            val toUnpin = pinnableCandidates.filter { keepUnarchivedEpisodes.contains(it.audioUrl) }
+                            if (toUnpin.isNotEmpty()) {
+                                onUnpinEpisodes(toUnpin)
+                                Toast.makeText(
+                                    context,
+                                    if (hasSelected) "Unpinned ${toUnpin.size} selected episode(s)" else "Unpinned ${toUnpin.size} episode(s)",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                onClearSelection()
+                            } else {
+                                onClearSelection()
+                            }
+                        }
+                    )
+                } else {
+                    DropdownMenuItem(
+                        text = { Text(if (hasSelected) "Pin selected episodes" else "Pin all") },
+                        leadingIcon = {
+                            Icon(Icons.Filled.PushPin, contentDescription = null)
+                        },
+                        onClick = {
+                            subtleHaptic()
+                            expanded = false
+                            val toPin = pinnableCandidates.filter { !keepUnarchivedEpisodes.contains(it.audioUrl) }
+                            if (toPin.isNotEmpty()) {
+                                onPinEpisodes(toPin)
+                                Toast.makeText(
+                                    context,
+                                    if (hasSelected) "Pinned ${toPin.size} selected episode(s)" else "Pinned ${toPin.size} episode(s)",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                onClearSelection()
+                            } else {
+                                Toast.makeText(
+                                    context,
+                                    if (hasSelected) "Selected episode(s) are already pinned" else "All episodes are already pinned",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                                onClearSelection()
+                            }
+                        }
+                    )
+                }
+            }
+            if (showUnarchiveOption) {
                 DropdownMenuItem(
                     text = { Text(if (hasSelected) "Unarchive Selected" else "Unarchive All") },
                     leadingIcon = {
@@ -7840,7 +8754,8 @@ fun PodcastOptionsMenu(
                         }
                     }
                 )
-            } else {
+            }
+            if (showArchiveOption) {
                 DropdownMenuItem(
                     text = { Text(if (hasSelected) "Archive Selected" else "Archive All") },
                     leadingIcon = {
@@ -7974,7 +8889,7 @@ fun PodcastDetailView(
                     Icon(Icons.Default.Close, contentDescription = "Clear selection")
                 }
                 Spacer(Modifier.width(8.dp))
-                Text(
+                AutoFitSingleLineText(
                     text = "${selectedEpisodeUrls.size} selected",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
@@ -8013,6 +8928,9 @@ fun PodcastDetailView(
                     }
                 }
             }
+            val upNextUrlSet = remember(vm.upNextQueue) {
+                vm.upNextQueue.map { it.episode.audioUrl }.toSet()
+            }
             PodcastOptionsMenu(
                 podcast = podcast,
                 episodes = displayedEpisodes,
@@ -8021,12 +8939,18 @@ fun PodcastDetailView(
                 activeDownloads = activeDownloads,
                 archivedEpisodes = archivedEpisodes,
                 keepUnarchivedEpisodes = keepUnarchivedEpisodes,
+                autoArchiveEnabled = autoArchiveEnabled,
+                upNextUrls = upNextUrlSet,
+                currentEpisodeUrl = vm.currentEpisode?.audioUrl,
                 selectedEpisodeUrls = selectedEpisodeUrls,
                 showArchived = showArchived,
                 filterMode = filterMode,
                 onSelectAll = { selectedEpisodeUrls = displayedEpisodes.map { it.audioUrl }.toSet() },
                 onClearSelection = { selectedEpisodeUrls = emptySet() },
                 onDownloadAll = { vm.downloadAllEpisodes(podcast, it) },
+                onAddToUpNext = { vm.addMultipleToUpNext(podcast, it) },
+                onPinEpisodes = { vm.pinEpisodes(it) },
+                onUnpinEpisodes = { vm.unpinEpisodes(it) },
                 onArchiveAll = { vm.archiveAllEpisodes(it) },
                 onUnarchiveAll = { vm.unarchiveAllEpisodes(it) },
                 onOpenLocalAudioSettings = onOpenLocalAudioSettings
@@ -8034,6 +8958,7 @@ fun PodcastDetailView(
         }
 
         val detailConfig = LocalConfiguration.current
+        val density = LocalDensity.current
         val isCompactDetail = detailConfig.screenHeightDp < 840 || detailConfig.screenWidthDp < 370
 
         val (savedIndex, savedOffset) = remember(podcast.feedUrl) {
@@ -8043,413 +8968,310 @@ fun PodcastDetailView(
             LazyListState(savedIndex, savedOffset)
         }
 
-        val isScrolled by remember {
-            derivedStateOf {
-                episodeListState.firstVisibleItemIndex > 0 || episodeListState.firstVisibleItemScrollOffset > 30
-            }
-        }
-        val shouldShrinkHeader = selectedTab == 0 && isScrolled
-
         val maxArtSize = if (isCompactDetail) 116.dp else 140.dp
         val minArtSize = if (isCompactDetail) 56.dp else 66.dp
-        val animatedArtSize by animateDpAsState(
-            targetValue = if (shouldShrinkHeader) minArtSize else maxArtSize,
-            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
-            label = "headerArtSize"
-        )
-        val animatedCorner by animateDpAsState(
-            targetValue = if (shouldShrinkHeader) 14.dp else (if (isCompactDetail) 22.dp else 26.dp),
-            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
-            label = "headerCorner"
-        )
-        val animatedTitleSize by animateFloatAsState(
-            targetValue = if (shouldShrinkHeader) 15f else (if (isCompactDetail) 18f else 22f),
-            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
-            label = "headerTitleSize"
-        )
-        val animatedSpacerHeight by animateDpAsState(
-            targetValue = if (shouldShrinkHeader) 4.dp else (if (isCompactDetail) 6.dp else 10.dp),
-            animationSpec = spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
-            label = "headerSpacerHeight"
-        )
+        val maxCorner = if (isCompactDetail) 22.dp else 26.dp
+        val minCorner = 14.dp
+        val maxTitleSize = if (isCompactDetail) 18f else 22f
+        val minTitleSize = 15f
+        val maxSpacerHeight = if (isCompactDetail) 6.dp else 10.dp
+        val minSpacerHeight = 4.dp
+        val maxBottomPad = if (isCompactDetail) 6.dp else 10.dp
+        val minBottomPad = 4.dp
+        val hasAuthor = podcast.author.isNotBlank() && podcast.author != "Unknown"
 
-        // Centered Podcast Artwork & Title Header
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 2.dp, bottom = if (shouldShrinkHeader) 4.dp else (if (isCompactDetail) 6.dp else 10.dp)),
-            horizontalAlignment = Alignment.CenterHorizontally
+        val textMeasurer = rememberTextMeasurer()
+        val titleBaseStyle = MaterialTheme.typography.titleLarge
+        val authorBaseStyle = MaterialTheme.typography.bodyMedium
+
+        val (expandedTitleHeight, collapsedTitleHeight, expandedAuthorHeight) = remember(
+            podcast.title,
+            podcast.author,
+            detailConfig.screenWidthDp,
+            maxTitleSize,
+            density.density,
+            density.fontScale
         ) {
-            Surface(
-                shape = RoundedCornerShape(animatedCorner),
-                shadowElevation = if (shouldShrinkHeader) 2.dp else 4.dp,
-                tonalElevation = 2.dp,
-                modifier = Modifier.size(animatedArtSize)
-            ) {
-                AsyncImage(
-                    model = podcast.artworkUrl,
-                    contentDescription = podcast.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                )
-            }
-
-            Spacer(modifier = Modifier.height(animatedSpacerHeight))
-
-            Text(
+            val titleMaxWidthPx = with(density) { (detailConfig.screenWidthDp.dp - 64.dp).roundToPx().coerceAtLeast(100) }
+            val authorMaxWidthPx = with(density) { (detailConfig.screenWidthDp.dp - 80.dp).roundToPx().coerceAtLeast(100) }
+            val expTitleResult = textMeasurer.measure(
                 text = podcast.title,
-                style = MaterialTheme.typography.titleLarge.copy(
-                    fontSize = animatedTitleSize.sp,
-                    lineHeight = (animatedTitleSize * 1.25f).sp
+                style = titleBaseStyle.copy(
+                    fontSize = maxTitleSize.sp,
+                    lineHeight = (maxTitleSize * 1.25f).sp,
+                    fontWeight = FontWeight.Bold
                 ),
-                fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center,
-                maxLines = if (shouldShrinkHeader) 1 else 2,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(horizontal = 16.dp)
+                constraints = Constraints(maxWidth = titleMaxWidthPx)
             )
+            val colTitleResult = textMeasurer.measure(
+                text = podcast.title,
+                style = titleBaseStyle.copy(
+                    fontSize = minTitleSize.sp,
+                    lineHeight = (minTitleSize * 1.25f).sp,
+                    fontWeight = FontWeight.Bold
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                constraints = Constraints(maxWidth = titleMaxWidthPx)
+            )
+            val authorHeightDp = if (hasAuthor) {
+                val authResult = textMeasurer.measure(
+                    text = podcast.author,
+                    style = authorBaseStyle,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    constraints = Constraints(maxWidth = authorMaxWidthPx)
+                )
+                with(density) { authResult.size.height.toDp() } + 2.dp
+            } else {
+                0.dp
+            }
+            Triple(
+                with(density) { expTitleResult.size.height.toDp() },
+                with(density) { colTitleResult.size.height.toDp() },
+                authorHeightDp
+            )
+        }
 
-            AnimatedVisibility(visible = !shouldShrinkHeader && podcast.author.isNotBlank() && podcast.author != "Unknown") {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    Spacer(modifier = Modifier.height(2.dp))
-                    Text(
-                        text = podcast.author,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.padding(horizontal = 24.dp)
-                    )
+        val expandedHeaderHeight = 2.dp + maxArtSize + maxSpacerHeight + expandedTitleHeight + expandedAuthorHeight + maxBottomPad
+        val collapsedHeaderHeight = 2.dp + minArtSize + minSpacerHeight + collapsedTitleHeight + minBottomPad
+        val expandedHeaderPx = with(density) { expandedHeaderHeight.roundToPx() }
+        val collapsedHeaderPx = with(density) { collapsedHeaderHeight.roundToPx() }
+        val maxCollapsePxInt = (expandedHeaderPx - collapsedHeaderPx).coerceAtLeast(0)
+        val maxCollapsePx = maxCollapsePxInt.toFloat()
+        val maxCollapseHeight = with(density) { maxCollapsePxInt.toDp() }
+
+        val isEpisodeListActive = selectedTab == 0 && !(vm.isLoading && episodes.isEmpty()) && displayedEpisodes.isNotEmpty()
+
+        val collapseFraction by remember(maxCollapsePx, isEpisodeListActive) {
+            derivedStateOf {
+                if (!isEpisodeListActive || maxCollapsePx <= 0f) {
+                    0f
+                } else if (episodeListState.firstVisibleItemIndex > 0) {
+                    1f
+                } else {
+                    (episodeListState.firstVisibleItemScrollOffset.toFloat() / maxCollapsePx).coerceIn(0f, 1f)
                 }
             }
         }
 
-        // Navigation Tabs: Episodes & Podcast Info
-        TabRow(
-            selectedTabIndex = selectedTab,
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(24.dp)),
-            divider = {}
-        ) {
-            Tab(
-                selected = selectedTab == 0,
-                onClick = {
-                    subtleHaptic()
-                    selectedTab = 0
-                },
-                text = {
-                    Text(
-                        if (episodes.isNotEmpty()) "Episodes (${episodes.size})" else "Episodes",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Medium
-                    )
-                },
-                icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(18.dp)) }
-            )
-            Tab(
-                selected = selectedTab == 1,
-                onClick = {
-                    subtleHaptic()
-                    selectedTab = 1
-                },
-                text = {
-                    Text(
-                        "Podcast Info",
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Medium
-                    )
-                },
-                icon = { Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(18.dp)) }
-            )
+        val currentArtSize = androidx.compose.ui.unit.lerp(maxArtSize, minArtSize, collapseFraction)
+        val currentCorner = androidx.compose.ui.unit.lerp(maxCorner, minCorner, collapseFraction)
+        val currentShadow = androidx.compose.ui.unit.lerp(4.dp, 2.dp, collapseFraction)
+        val currentTitleSize = maxTitleSize + (minTitleSize - maxTitleSize) * collapseFraction
+        val currentSpacerHeight = androidx.compose.ui.unit.lerp(maxSpacerHeight, minSpacerHeight, collapseFraction)
+        val currentBottomPad = androidx.compose.ui.unit.lerp(maxBottomPad, minBottomPad, collapseFraction)
+        val currentTitleHeight = androidx.compose.ui.unit.lerp(expandedTitleHeight, collapsedTitleHeight, collapseFraction)
+        val currentAuthorHeight = androidx.compose.ui.unit.lerp(expandedAuthorHeight, 0.dp, collapseFraction)
+        val currentHeaderHeight = with(density) {
+            (collapsedHeaderPx + ((1f - collapseFraction) * maxCollapsePx).toInt()).toDp()
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        val downloadedSet = remember(downloadedEpisodes) { downloadedEpisodes.map { it.audioUrl }.toSet() }
+        val unarchivedCount = episodes.count { ep -> !archivedEpisodes.contains(ep.audioUrl) }
+        val unplayedCount = episodes.count { ep -> !playedEpisodes.contains(ep.audioUrl) && !archivedEpisodes.contains(ep.audioUrl) }
+        val downloadedCount = episodes.count { ep -> downloadedSet.contains(ep.audioUrl) || localAudioSet.contains(ep.audioUrl) }
+        val archivedCount = episodes.count { ep -> archivedEpisodes.contains(ep.audioUrl) }
 
-        if (vm.isLoading && episodes.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .padding(24.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                CircularProgressIndicator()
-            }
-        } else {
-            when (selectedTab) {
-                0 -> {
-                    // Episodes Tab
-                    LaunchedEffect(episodeListState) {
-                        snapshotFlow { episodeListState.firstVisibleItemIndex }
-                            .distinctUntilChanged()
-                            .collect { idx ->
-                                vm.saveEpisodeListPosition(podcast.feedUrl, idx, episodeListState.firstVisibleItemScrollOffset)
-                            }
-                    }
-                    DisposableEffect(episodeListState) {
-                        onDispose {
-                            vm.saveEpisodeListPosition(podcast.feedUrl, episodeListState.firstVisibleItemIndex, episodeListState.firstVisibleItemScrollOffset)
-                        }
-                    }
-                    val downloadedSet = remember(downloadedEpisodes) { downloadedEpisodes.map { it.audioUrl }.toSet() }
-                    val unarchivedCount = episodes.count { ep -> !archivedEpisodes.contains(ep.audioUrl) }
-                    val unplayedCount = episodes.count { ep -> !playedEpisodes.contains(ep.audioUrl) && !archivedEpisodes.contains(ep.audioUrl) }
-                    val downloadedCount = episodes.count { ep -> downloadedSet.contains(ep.audioUrl) || localAudioSet.contains(ep.audioUrl) }
-                    val archivedCount = episodes.count { ep -> archivedEpisodes.contains(ep.audioUrl) }
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .horizontalScroll(rememberScrollState())
-                            .padding(bottom = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        FilterChip(
-                            selected = filterMode == 0,
-                            onClick = {
-                                subtleHaptic()
-                                filterMode = 0
-                            },
-                            label = { Text(if (showArchived) "All (${episodes.size})" else "All ($unarchivedCount)") },
-                            leadingIcon = if (filterMode == 0) {
-                                { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                            } else null,
-                            shape = RoundedCornerShape(16.dp)
-                        )
-                        FilterChip(
-                            selected = filterMode == 1,
-                            onClick = {
-                                subtleHaptic()
-                                filterMode = 1
-                            },
-                            label = { Text("Unplayed ($unplayedCount)") },
-                            leadingIcon = if (filterMode == 1) {
-                                { Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                            } else null,
-                            shape = RoundedCornerShape(16.dp)
-                        )
-                        FilterChip(
-                            selected = filterMode == 2,
-                            onClick = {
-                                subtleHaptic()
-                                filterMode = 2
-                            },
-                            label = { Text("Downloaded ($downloadedCount)") },
-                            leadingIcon = {
-                                Icon(
-                                    if (filterMode == 2) Icons.Default.CheckCircle else Icons.Default.DownloadDone,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            },
-                            shape = RoundedCornerShape(16.dp)
-                        )
-                        FilterChip(
-                            selected = filterMode == 3,
-                            onClick = {
-                                subtleHaptic()
-                                filterMode = 3
-                            },
-                            label = { Text("Archived ($archivedCount)") },
-                            leadingIcon = if (filterMode == 3) {
-                                { Icon(Icons.Default.Archive, contentDescription = null, modifier = Modifier.size(16.dp)) }
-                            } else null,
-                            shape = RoundedCornerShape(16.dp)
-                        )
-                        FilterChip(
-                            selected = showArchived,
-                            onClick = {
-                                subtleHaptic()
-                                showArchived = !showArchived
-                                if (filterMode == 3 && !showArchived) {
-                                    filterMode = 0
-                                }
-                            },
-                            label = { Text(if (showArchived) "Hide Archived" else "Show Archived") },
-                            leadingIcon = {
-                                Icon(
-                                    if (showArchived) Icons.Default.VisibilityOff else Icons.Default.Visibility,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            },
-                            shape = RoundedCornerShape(16.dp),
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
-                                selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
-                            )
-                        )
-                    }
-
-                    if (displayedEpisodes.isEmpty()) {
+        Layout(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            content = {
+                // 0: Body content (Episodes list, loading, empty state, or Podcast Info)
+                Box(modifier = Modifier.fillMaxSize()) {
+                    if (vm.isLoading && episodes.isEmpty()) {
                         Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .padding(32.dp),
+                                .fillMaxSize()
+                                .padding(24.dp),
                             contentAlignment = Alignment.Center
                         ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Icon(
-                                    when (filterMode) {
-                                        1 -> Icons.Default.CheckCircle
-                                        2 -> Icons.Default.DownloadDone
-                                        3 -> Icons.Default.Archive
-                                        else -> Icons.AutoMirrored.Filled.List
-                                    },
-                                    contentDescription = null,
-                                    modifier = Modifier.size(48.dp),
-                                    tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
-                                )
-                                Spacer(Modifier.height(8.dp))
-                                Text(
-                                    if (filterMode == 0 && !showArchived && archivedCount > 0) {
-                                        "All episodes in this podcast are archived"
-                                    } else when (filterMode) {
-                                        1 -> "All caught up! No unplayed episodes."
-                                        2 -> "No downloaded episodes for this podcast"
-                                        3 -> "No archived episodes for this podcast"
-                                        else -> "No episodes found"
-                                    },
-                                    style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                                Spacer(Modifier.height(4.dp))
-                                Text(
-                                    if (filterMode == 0 && !showArchived && archivedCount > 0) {
-                                        "Tap 'Show Archived' above to view archived episodes."
-                                    } else when (filterMode) {
-                                        1 -> "New episodes will appear here when released."
-                                        2 -> "Tap the download icon on any episode to save it for offline listening."
-                                        3 -> "Archived episodes will appear here."
-                                        else -> "Check back later for new episodes."
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    textAlign = TextAlign.Center
-                                )
-                            }
+                            CircularProgressIndicator()
                         }
                     } else {
-                        LazyColumn(
-                            state = episodeListState,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            items(
-                                items = displayedEpisodes,
-                                key = { it.audioUrl }
-                            ) { ep ->
-                                val isArchived = archivedEpisodes.contains(ep.audioUrl)
-                                val isPlayed = playedEpisodes.contains(ep.audioUrl)
-                                val isDownloaded = downloadedSet.contains(ep.audioUrl)
-                                val downloadProgress = activeDownloads[ep.audioUrl]
-                                val isDownloading = downloadProgress != null
-                                val downloadSize = vm.getFormattedDownloadSize(ep.audioUrl)
-
-                                val isCurrent = vm.currentEpisode?.audioUrl == ep.audioUrl
-                                val isPlaying = isCurrent && vm.isPlaying
-                                val totalDurationMs = if (isCurrent && vm.duration > 0L) vm.duration else parseDurationMs(ep.durationText)
-                                val currentPosMs = if (isCurrent) vm.currentPosition else vm.getSavedPosition(ep.audioUrl)
-
-                                val remainingTimeText = if (currentPosMs > 0L && totalDurationMs > 0L) {
-                                    val remainingMs = (totalDurationMs - currentPosMs).coerceAtLeast(0L)
-                                    formatTimeRemaining(remainingMs)
-                                } else if (isCurrent && currentPosMs > 0L) {
-                                    "${currentPosMs / 60000}m listened"
-                                } else null
-
-                                val playbackProgress = if (currentPosMs > 0L && totalDurationMs > 0L) {
-                                    (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
-                                } else null
-
-                                val isKeepUnarchived = keepUnarchivedEpisodes.contains(ep.audioUrl)
-                                val isSelected = selectedEpisodeUrls.contains(ep.audioUrl)
-                                val isInUpNext = isCurrent || vm.upNextQueue.any { it.episode.audioUrl == ep.audioUrl }
-
-                                EpisodeRowCard(
-                                    podcast = podcast,
-                                    episode = ep,
-                                    isArchived = isArchived,
-                                    isPlayed = isPlayed,
-                                    isDownloaded = isDownloaded,
-                                    isDownloading = isDownloading,
-                                    downloadProgress = downloadProgress,
-                                    downloadSize = downloadSize,
-                                    remainingTimeText = remainingTimeText,
-                                    playbackProgress = playbackProgress,
-                                    isCurrentlyPlaying = isPlaying,
-                                    isKeepUnarchived = isKeepUnarchived,
-                                    isAutoArchiveEnabled = autoArchiveEnabled,
-                                    isSelected = isSelected,
-                                    isInUpNext = isInUpNext,
-                                    onPlay = {
-                                        if (selectedEpisodeUrls.isNotEmpty()) {
-                                            val sel = selectedEpisodeUrls.contains(ep.audioUrl)
-                                            selectedEpisodeUrls = if (sel) selectedEpisodeUrls - ep.audioUrl else selectedEpisodeUrls + ep.audioUrl
-                                        } else {
-                                            val epIndex = displayedEpisodes.indexOfFirst { it.audioUrl == ep.audioUrl }
-                                            if (epIndex >= 0) {
-                                                vm.saveEpisodeListPosition(podcast.feedUrl, epIndex, 0)
-                                            }
-                                            onEpisodeSelected(podcast, ep)
+                        when (selectedTab) {
+                            0 -> {
+                                // Episodes Tab
+                                LaunchedEffect(episodeListState) {
+                                    snapshotFlow { episodeListState.firstVisibleItemIndex to episodeListState.firstVisibleItemScrollOffset }
+                                        .distinctUntilChanged()
+                                        .collect { (idx, offset) ->
+                                            vm.saveEpisodeListPosition(podcast.feedUrl, idx, offset)
                                         }
-                                    },
-                                    onLongClick = {
-                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                        val sel = selectedEpisodeUrls.contains(ep.audioUrl)
-                                        selectedEpisodeUrls = if (sel) selectedEpisodeUrls - ep.audioUrl else selectedEpisodeUrls + ep.audioUrl
-                                    },
-                                    onAddToUpNext = {
-                                        if (vm.currentEpisode?.audioUrl == ep.audioUrl) {
-                                            Toast.makeText(context, "Currently playing", Toast.LENGTH_SHORT).show()
-                                        } else {
-                                            if (isInUpNext) {
-                                                vm.removeFromUpNextByUrl(ep.audioUrl)
-                                                Toast.makeText(context, "Removed from Up Next", Toast.LENGTH_SHORT).show()
-                                            } else {
-                                                vm.addToUpNext(podcast, ep)
-                                                Toast.makeText(context, "Added to Up Next (playing next)", Toast.LENGTH_SHORT).show()
+                                }
+                                DisposableEffect(episodeListState) {
+                                    onDispose {
+                                        vm.saveEpisodeListPosition(podcast.feedUrl, episodeListState.firstVisibleItemIndex, episodeListState.firstVisibleItemScrollOffset)
+                                    }
+                                }
+
+                                if (displayedEpisodes.isEmpty()) {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(32.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Icon(
+                                                when (filterMode) {
+                                                    1 -> Icons.Default.CheckCircle
+                                                    2 -> Icons.Default.DownloadDone
+                                                    3 -> Icons.Default.Archive
+                                                    else -> Icons.AutoMirrored.Filled.List
+                                                },
+                                                contentDescription = null,
+                                                modifier = Modifier.size(48.dp),
+                                                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                                            )
+                                            Spacer(Modifier.height(8.dp))
+                                            Text(
+                                                if (filterMode == 0 && !showArchived && archivedCount > 0) {
+                                                    "All episodes in this podcast are archived"
+                                                } else when (filterMode) {
+                                                    1 -> "All caught up! No unplayed episodes."
+                                                    2 -> "No downloaded episodes for this podcast"
+                                                    3 -> "No archived episodes for this podcast"
+                                                    else -> "No episodes found"
+                                                },
+                                                style = MaterialTheme.typography.titleMedium,
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                if (filterMode == 0 && !showArchived && archivedCount > 0) {
+                                                    "Tap 'Show Archived' above to view archived episodes."
+                                                } else when (filterMode) {
+                                                    1 -> "New episodes will appear here when released."
+                                                    2 -> "Tap the download icon on any episode to save it for offline listening."
+                                                    3 -> "Archived episodes will appear here."
+                                                    else -> "Check back later for new episodes."
+                                                },
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                textAlign = TextAlign.Center
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    LazyColumn(
+                                        state = episodeListState,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        item(key = "__header_expand_spacer__") {
+                                            Spacer(modifier = Modifier.height(maxCollapseHeight))
+                                        }
+                                        items(
+                                            items = displayedEpisodes,
+                                            key = { it.audioUrl }
+                                        ) { ep ->
+                                            val isArchived = archivedEpisodes.contains(ep.audioUrl)
+                                            val isPlayed = playedEpisodes.contains(ep.audioUrl)
+                                            val isDownloaded = downloadedSet.contains(ep.audioUrl)
+                                            val downloadProgress = activeDownloads[ep.audioUrl]
+                                            val isDownloading = downloadProgress != null
+                                            val downloadSize = vm.getFormattedDownloadSize(ep.audioUrl)
+
+                                            val isCurrent = vm.currentEpisode?.audioUrl == ep.audioUrl
+                                            val isPlaying = isCurrent && vm.isPlaying
+                                            val totalDurationMs = if (isCurrent && vm.duration > 0L) vm.duration else parseDurationMs(ep.durationText)
+                                            val currentPosMs = if (isCurrent) vm.currentPosition else vm.getSavedPosition(ep.audioUrl)
+
+                                            val remainingTimeText = if (currentPosMs > 0L && totalDurationMs > 0L) {
+                                                val remainingMs = (totalDurationMs - currentPosMs).coerceAtLeast(0L)
+                                                formatTimeRemaining(remainingMs)
+                                            } else if (isCurrent && currentPosMs > 0L) {
+                                                "${currentPosMs / 60000}m listened"
+                                            } else null
+
+                                            val playbackProgress = if (currentPosMs > 0L && totalDurationMs > 0L) {
+                                                (currentPosMs.toFloat() / totalDurationMs.toFloat()).coerceIn(0f, 1f)
+                                            } else null
+
+                                            val isKeepUnarchived = keepUnarchivedEpisodes.contains(ep.audioUrl)
+                                            val isSelected = selectedEpisodeUrls.contains(ep.audioUrl)
+                                            val isInUpNext = isCurrent || vm.upNextQueue.any { it.episode.audioUrl == ep.audioUrl }
+
+                                            Box(modifier = Modifier.padding(bottom = 10.dp)) {
+                                                EpisodeRowCard(
+                                                    podcast = podcast,
+                                                    episode = ep,
+                                                    isArchived = isArchived,
+                                                    isPlayed = isPlayed,
+                                                    isDownloaded = isDownloaded,
+                                                    isDownloading = isDownloading,
+                                                    downloadProgress = downloadProgress,
+                                                    downloadSize = downloadSize,
+                                                    remainingTimeText = remainingTimeText,
+                                                    playbackProgress = playbackProgress,
+                                                    isCurrentlyPlaying = isPlaying,
+                                                    isKeepUnarchived = isKeepUnarchived,
+                                                    isAutoArchiveEnabled = autoArchiveEnabled,
+                                                    isSelected = isSelected,
+                                                    isInUpNext = isInUpNext,
+                                                    onPlay = {
+                                                        if (selectedEpisodeUrls.isNotEmpty()) {
+                                                            val sel = selectedEpisodeUrls.contains(ep.audioUrl)
+                                                            selectedEpisodeUrls = if (sel) selectedEpisodeUrls - ep.audioUrl else selectedEpisodeUrls + ep.audioUrl
+                                                        } else {
+                                                            vm.saveEpisodeListPosition(
+                                                                podcast.feedUrl,
+                                                                episodeListState.firstVisibleItemIndex,
+                                                                episodeListState.firstVisibleItemScrollOffset
+                                                            )
+                                                            onEpisodeSelected(podcast, ep)
+                                                        }
+                                                    },
+                                                    onLongClick = {
+                                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                                        val sel = selectedEpisodeUrls.contains(ep.audioUrl)
+                                                        selectedEpisodeUrls = if (sel) selectedEpisodeUrls - ep.audioUrl else selectedEpisodeUrls + ep.audioUrl
+                                                    },
+                                                    onAddToUpNext = {
+                                                        if (vm.currentEpisode?.audioUrl == ep.audioUrl) {
+                                                            Toast.makeText(context, "Currently playing", Toast.LENGTH_SHORT).show()
+                                                        } else {
+                                                            if (isInUpNext) {
+                                                                vm.removeFromUpNextByUrl(ep.audioUrl)
+                                                                Toast.makeText(context, "Removed from Up Next", Toast.LENGTH_SHORT).show()
+                                                            } else {
+                                                                vm.addToUpNext(podcast, ep)
+                                                                Toast.makeText(context, "Added to Up Next (playing next)", Toast.LENGTH_SHORT).show()
+                                                            }
+                                                        }
+                                                    },
+                                                    onTogglePlayed = { vm.markEpisodePlayed(ep, !isPlayed) },
+                                                    onToggleArchive = { vm.toggleArchive(ep, !isArchived) },
+                                                    onToggleKeepUnarchived = {
+                                                        val willKeep = !isKeepUnarchived
+                                                        vm.toggleKeepUnarchived(ep)
+                                                        Toast.makeText(
+                                                            context,
+                                                            if (willKeep) "Episode Pinned (will stay unarchived)" else "Episode Unpinned (auto-archive restored)",
+                                                            Toast.LENGTH_SHORT
+                                                        ).show()
+                                                    },
+                                                    onDownload = { vm.downloadEpisode(podcast, ep) },
+                                                    onCancelDownload = { vm.cancelDownload(ep.audioUrl) },
+                                                    onDeleteDownload = { vm.deleteDownload(ep.audioUrl) }
+                                                )
                                             }
                                         }
-                                    },
-                                    onTogglePlayed = { vm.markEpisodePlayed(ep, !isPlayed) },
-                                    onToggleArchive = { vm.toggleArchive(ep, !isArchived) },
-                                    onToggleKeepUnarchived = {
-                                        val willKeep = !isKeepUnarchived
-                                        vm.toggleKeepUnarchived(ep)
-                                        Toast.makeText(
-                                            context,
-                                            if (willKeep) "Episode Pinned (will stay unarchived)" else "Episode Unpinned (auto-archive restored)",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    },
-                                    onDownload = { vm.downloadEpisode(podcast, ep) },
-                                    onCancelDownload = { vm.cancelDownload(ep.audioUrl) },
-                                    onDeleteDownload = { vm.deleteDownload(ep.audioUrl) }
-                                )
+                                    }
+                                }
                             }
-                        }
-                    }
-                }
-                1 -> {
-                    // Podcast Info Tab
-                    val cachedFeed = remember(podcast.feedUrl) { NetworkModule.getCachedFeed(podcast.feedUrl) }
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                            .verticalScroll(rememberScrollState())
-                            .padding(bottom = 24.dp)
-                    ) {
+                            1 -> {
+                                // Podcast Info Tab
+                                val cachedFeed = remember(podcast.feedUrl) { NetworkModule.getCachedFeed(podcast.feedUrl) }
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(bottom = 24.dp)
+                                ) {
                         // About Card
                         Card(
                             shape = RoundedCornerShape(24.dp),
@@ -8459,7 +9281,7 @@ fun PodcastDetailView(
                                 .padding(bottom = 12.dp)
                         ) {
                             Column(modifier = Modifier.padding(18.dp)) {
-                                Text(
+                                AutoFitSingleLineText(
                                     text = "About",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
@@ -8491,7 +9313,7 @@ fun PodcastDetailView(
                                 .padding(bottom = 12.dp)
                         ) {
                             Column(modifier = Modifier.padding(18.dp)) {
-                                Text(
+                                AutoFitSingleLineText(
                                     text = "Details",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
@@ -8586,7 +9408,7 @@ fun PodcastDetailView(
                                     .padding(bottom = 16.dp)
                             ) {
                                 Column(modifier = Modifier.padding(18.dp)) {
-                                    Text(
+                                    AutoFitSingleLineText(
                                         text = "Local Audio Collection",
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold,
@@ -8613,7 +9435,7 @@ fun PodcastDetailView(
                                             modifier = Modifier.size(18.dp)
                                         )
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Text("Manage Local Audio Files")
+                                        AutoFitSingleLineText("Manage Local Audio Files", style = MaterialTheme.typography.labelLarge)
                                     }
                                 }
                             }
@@ -8626,7 +9448,7 @@ fun PodcastDetailView(
                                     .padding(bottom = 16.dp)
                             ) {
                                 Column(modifier = Modifier.padding(18.dp)) {
-                                    Text(
+                                    AutoFitSingleLineText(
                                         text = "Feed & Subscription",
                                         style = MaterialTheme.typography.titleMedium,
                                         fontWeight = FontWeight.Bold,
@@ -8697,9 +9519,9 @@ fun PodcastDetailView(
                                                 tint = if (hasCredentials) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                             )
                                             Spacer(modifier = Modifier.width(10.dp))
-                                            Column {
-                                                Text(
-                                                    "Feed Authentication",
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                AutoFitSingleLineText(
+                                                    text = "Feed Authentication",
                                                     style = MaterialTheme.typography.bodyMedium,
                                                     fontWeight = FontWeight.SemiBold
                                                 )
@@ -8741,7 +9563,10 @@ fun PodcastDetailView(
                                             modifier = Modifier.size(18.dp)
                                         )
                                         Spacer(modifier = Modifier.width(8.dp))
-                                        Text(if (isSubscribed) "Subscribed (Tap to unsubscribe)" else "Subscribe to Podcast")
+                                        AutoFitSingleLineText(
+                                            text = if (isSubscribed) "Subscribed (Tap to unsubscribe)" else "Subscribe to Podcast",
+                                            style = MaterialTheme.typography.labelLarge
+                                        )
                                     }
 
                                     if (isSubscribed) {
@@ -8769,9 +9594,9 @@ fun PodcastDetailView(
                                                     tint = if (isNotified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                                 )
                                                 Spacer(modifier = Modifier.width(10.dp))
-                                                Column {
-                                                    Text(
-                                                        "New Episode Notifications",
+                                                Column(modifier = Modifier.weight(1f)) {
+                                                    AutoFitSingleLineText(
+                                                        text = "New Episode Notifications",
                                                         style = MaterialTheme.typography.bodyMedium,
                                                         fontWeight = FontWeight.SemiBold
                                                     )
@@ -8796,6 +9621,241 @@ fun PodcastDetailView(
                         }
                     }
                 }
+            }
+        }
+                }
+
+                // 1: Centered Podcast Artwork & Title Header
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(currentHeaderHeight)
+                        .background(MaterialTheme.colorScheme.background)
+                        .scrollable(
+                            state = episodeListState,
+                            orientation = Orientation.Vertical,
+                            reverseDirection = true,
+                            enabled = isEpisodeListActive
+                        )
+                        .padding(top = 2.dp, bottom = currentBottomPad),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(currentCorner),
+                        shadowElevation = currentShadow,
+                        tonalElevation = 2.dp,
+                        modifier = Modifier.size(currentArtSize)
+                    ) {
+                        AsyncImage(
+                            model = podcast.artworkUrl,
+                            contentDescription = podcast.title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(currentSpacerHeight))
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(currentTitleHeight),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = podcast.title,
+                            style = MaterialTheme.typography.titleLarge.copy(
+                                fontSize = currentTitleSize.sp,
+                                lineHeight = (currentTitleSize * 1.25f).sp
+                            ),
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center,
+                            maxLines = if (collapseFraction > 0.65f) 1 else 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .padding(horizontal = 16.dp)
+                                .wrapContentHeight(unbounded = true)
+                        )
+                    }
+
+                    if (hasAuthor && currentAuthorHeight > 0.dp) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(currentAuthorHeight)
+                                .graphicsLayer { alpha = (1f - collapseFraction * 1.5f).coerceIn(0f, 1f) },
+                            contentAlignment = Alignment.TopCenter
+                        ) {
+                            Text(
+                                text = podcast.author,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .padding(top = 2.dp, start = 24.dp, end = 24.dp)
+                                    .wrapContentHeight(unbounded = true, align = Alignment.Top)
+                            )
+                        }
+                    }
+                }
+
+                // 2: Navigation Tabs & Filter Chips
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.background)
+                ) {
+                    TabRow(
+                        selectedTabIndex = selectedTab,
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(24.dp)),
+                        divider = {}
+                    ) {
+                        Tab(
+                            selected = selectedTab == 0,
+                            onClick = {
+                                subtleHaptic()
+                                selectedTab = 0
+                            },
+                            text = {
+                                AutoFitSingleLineText(
+                                    text = if (episodes.isNotEmpty()) "Episodes (${episodes.size})" else "Episodes",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Medium
+                                )
+                            },
+                            icon = { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
+                        Tab(
+                            selected = selectedTab == 1,
+                            onClick = {
+                                subtleHaptic()
+                                selectedTab = 1
+                            },
+                            text = {
+                                AutoFitSingleLineText(
+                                    text = "Podcast Info",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Medium
+                                )
+                            },
+                            icon = { Icon(Icons.Default.Info, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    if (selectedTab == 0 && !(vm.isLoading && episodes.isEmpty())) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState())
+                                .padding(bottom = 8.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            FilterChip(
+                                selected = filterMode == 0,
+                                onClick = {
+                                    subtleHaptic()
+                                    filterMode = 0
+                                },
+                                label = { Text(if (showArchived) "All (${episodes.size})" else "All ($unarchivedCount)") },
+                                leadingIcon = if (filterMode == 0) {
+                                    { Icon(Icons.AutoMirrored.Filled.List, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                } else null,
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            FilterChip(
+                                selected = filterMode == 1,
+                                onClick = {
+                                    subtleHaptic()
+                                    filterMode = 1
+                                },
+                                label = { Text("Unplayed ($unplayedCount)") },
+                                leadingIcon = if (filterMode == 1) {
+                                    { Icon(Icons.Default.Schedule, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                } else null,
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            FilterChip(
+                                selected = filterMode == 2,
+                                onClick = {
+                                    subtleHaptic()
+                                    filterMode = 2
+                                },
+                                label = { Text("Downloaded ($downloadedCount)") },
+                                leadingIcon = {
+                                    Icon(
+                                        if (filterMode == 2) Icons.Default.CheckCircle else Icons.Default.DownloadDone,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            FilterChip(
+                                selected = filterMode == 3,
+                                onClick = {
+                                    subtleHaptic()
+                                    filterMode = 3
+                                },
+                                label = { Text("Archived ($archivedCount)") },
+                                leadingIcon = if (filterMode == 3) {
+                                    { Icon(Icons.Default.Archive, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                                } else null,
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            FilterChip(
+                                selected = showArchived,
+                                onClick = {
+                                    subtleHaptic()
+                                    showArchived = !showArchived
+                                    if (filterMode == 3 && !showArchived) {
+                                        filterMode = 0
+                                    }
+                                },
+                                label = { Text(if (showArchived) "Hide Archived" else "Show Archived") },
+                                leadingIcon = {
+                                    Icon(
+                                        if (showArchived) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                },
+                                shape = RoundedCornerShape(16.dp),
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = MaterialTheme.colorScheme.secondaryContainer,
+                                    selectedLabelColor = MaterialTheme.colorScheme.onSecondaryContainer
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        ) { measurables, constraints ->
+            val headerPlaceable = measurables[1].measure(constraints.copy(minHeight = 0))
+            val tabsPlaceable = measurables[2].measure(constraints.copy(minHeight = 0))
+            val collapsedTopPx = (collapsedHeaderPx + tabsPlaceable.height).coerceAtMost(constraints.maxHeight)
+            val bodyTopPx = if (isEpisodeListActive) {
+                collapsedTopPx
+            } else {
+                (headerPlaceable.height + tabsPlaceable.height).coerceAtMost(constraints.maxHeight)
+            }
+            val bodyHeightPx = (constraints.maxHeight - bodyTopPx).coerceAtLeast(0)
+            val bodyPlaceable = measurables[0].measure(
+                constraints.copy(minHeight = bodyHeightPx, maxHeight = bodyHeightPx)
+            )
+            layout(constraints.maxWidth, constraints.maxHeight) {
+                bodyPlaceable.placeRelative(0, bodyTopPx)
+                headerPlaceable.placeRelative(0, 0)
+                tabsPlaceable.placeRelative(0, headerPlaceable.height)
             }
         }
     }
@@ -8888,7 +9948,7 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                         val prefill = if (SecurityUtils.looksLikeFeedUrl(vm.searchQuery)) vm.searchQuery else ""
                         vm.openAddCustomFeedDialog(initialUrl = prefill)
                     },
-                    label = { Text("Add Custom / Private RSS Feed") },
+                    label = { AutoFitSingleLineText("Add Custom / Private RSS Feed", style = MaterialTheme.typography.labelLarge) },
                     leadingIcon = {
                         Icon(
                             Icons.Default.RssFeed,
@@ -8957,7 +10017,7 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                                     Text(
                                         text = podcast.title,
                                         style = MaterialTheme.typography.titleMedium,
-                                        fontWeight = FontWeight.ExtraBold,
+                                        fontWeight = FontWeight.Bold,
                                         maxLines = 2
                                     )
                                     Text(
@@ -8995,10 +10055,11 @@ fun DiscoverScreen(vm: PodcastViewModel, onEpisodeSelected: (Podcast, Episode) -
                         tint = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.size(20.dp)
                     )
-                    Text(
+                    AutoFitSingleLineText(
                         text = "Suggested Podcasts",
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
                     )
                 }
 
@@ -9171,8 +10232,8 @@ fun ExpressivePlayerScreen(
                 ) {
                     Icon(Icons.Default.GraphicEq, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(
-                        "Player",
+                    AutoFitSingleLineText(
+                        text = "Player",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (selectedTab == 0) FontWeight.Bold else FontWeight.Medium
                     )
@@ -9194,7 +10255,7 @@ fun ExpressivePlayerScreen(
                     Icon(Icons.Default.Bookmarks, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
                     val count = vm.currentChapters.size
-                    Text(
+                    AutoFitSingleLineText(
                         text = if (count > 0) "Chapters ($count)" else "Chapters",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (selectedTab == 1) FontWeight.Bold else FontWeight.Medium
@@ -9216,8 +10277,8 @@ fun ExpressivePlayerScreen(
                 ) {
                     Icon(Icons.Default.Description, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(Modifier.width(6.dp))
-                    Text(
-                        "Notes",
+                    AutoFitSingleLineText(
+                        text = "Notes",
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (selectedTab == 2) FontWeight.Bold else FontWeight.Medium
                     )
@@ -9314,7 +10375,7 @@ fun ExpressivePlayerScreen(
                         Text(
                             text = episode?.title ?: "Select an Episode",
                             style = if (isTight) MaterialTheme.typography.titleMedium else MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.ExtraBold,
+                            fontWeight = FontWeight.Bold,
                             textAlign = TextAlign.Center,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
@@ -9747,7 +10808,7 @@ fun ExpressivePlayerScreen(
                                                     Text(
                                                         text = PlaybackSpeedManager.formatSpeed(currentSpeed),
                                                         style = MaterialTheme.typography.titleSmall,
-                                                        fontWeight = FontWeight.ExtraBold,
+                                                        fontWeight = FontWeight.Bold,
                                                         color = MaterialTheme.colorScheme.primary
                                                     )
                                                 }
@@ -9845,10 +10906,10 @@ fun ExpressivePlayerScreen(
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(
+                                AutoFitSingleLineText(
                                     text = "Chapters",
                                     style = MaterialTheme.typography.titleLarge,
-                                    fontWeight = FontWeight.ExtraBold,
+                                    fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
                                 val count = vm.currentChapters.size
@@ -10044,7 +11105,7 @@ fun ExpressivePlayerScreen(
                                         Text(
                                             text = chapter.title,
                                             style = MaterialTheme.typography.titleSmall,
-                                            fontWeight = if (isActive) FontWeight.ExtraBold else FontWeight.Medium,
+                                            fontWeight = if (isActive) FontWeight.Bold else FontWeight.Medium,
                                             color = if (isActive) MaterialTheme.colorScheme.onPrimaryContainer
                                             else if (isPast) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
                                             else MaterialTheme.colorScheme.onSurface,
@@ -10109,7 +11170,7 @@ fun ExpressivePlayerScreen(
                     Text(
                         text = episode?.title ?: "No Episode Selected",
                         style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.ExtraBold,
+                        fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Spacer(Modifier.height(4.dp))
@@ -10204,14 +11265,14 @@ fun SkipPresetBottomSheet(
                 .fillMaxWidth()
                 .padding(horizontal = 24.dp, vertical = 16.dp)
         ) {
-            Text(
-                "Customize Skip Presets",
+            AutoFitSingleLineText(
+                text = "Customize Skip Presets",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold
             )
             Spacer(Modifier.height(16.dp))
 
-            Text("Rewind Time (Seconds)", style = MaterialTheme.typography.titleMedium)
+            AutoFitSingleLineText("Rewind Time (Seconds)", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 presetOptions.forEach { sec ->
@@ -10229,7 +11290,7 @@ fun SkipPresetBottomSheet(
 
             Spacer(Modifier.height(16.dp))
 
-            Text("Fast Forward Time (Seconds)", style = MaterialTheme.typography.titleMedium)
+            AutoFitSingleLineText("Fast Forward Time (Seconds)", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 presetOptions.forEach { sec ->
@@ -10301,10 +11362,11 @@ fun NotificationSettingsBottomSheet(
                     modifier = Modifier.size(28.dp)
                 )
                 Spacer(Modifier.width(12.dp))
-                Text(
-                    "Episode Notifications",
+                AutoFitSingleLineText(
+                    text = "Episode Notifications",
                     style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
                 )
             }
 
@@ -10321,7 +11383,7 @@ fun NotificationSettingsBottomSheet(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text(
+                        AutoFitSingleLineText(
                             text = "New Episode Alerts",
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.Bold
@@ -10376,11 +11438,12 @@ fun NotificationSettingsBottomSheet(
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(Modifier.width(8.dp))
-                            Text(
-                                "Background Sync Active",
+                            AutoFitSingleLineText(
+                                text = "Background Sync Active",
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f)
                             )
                         }
                         Spacer(Modifier.height(6.dp))
@@ -10400,7 +11463,7 @@ fun NotificationSettingsBottomSheet(
                         ) {
                             Icon(Icons.Default.Sync, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
-                            Text("Check Subscriptions Now")
+                            AutoFitSingleLineText("Check Subscriptions Now", style = MaterialTheme.typography.labelLarge)
                         }
                     }
                 }
@@ -10749,7 +11812,7 @@ fun SubscriptionsScreen(
                                         Text(
                                             text = podcast.title,
                                             style = MaterialTheme.typography.titleMedium,
-                                            fontWeight = FontWeight.ExtraBold,
+                                            fontWeight = FontWeight.Bold,
                                             maxLines = 2
                                         )
                                         Row(
@@ -10867,7 +11930,7 @@ fun SubscriptionEpisodeBadge(
             Text(
                 text = displayCount,
                 style = MaterialTheme.typography.labelSmall.copy(
-                    fontWeight = FontWeight.ExtraBold,
+                    fontWeight = FontWeight.Bold,
                     fontSize = if (compact) 10.sp else 11.sp,
                     lineHeight = 12.sp
                 ),
@@ -10935,11 +11998,12 @@ fun CustomRssFeedDialog(vm: PodcastViewModel) {
             )
         },
         title = {
-            Text(
+            AutoFitSingleLineText(
                 text = if (isEditing) "Feed Authentication" else "Add Custom RSS Feed",
                 style = MaterialTheme.typography.headlineSmall,
                 fontWeight = FontWeight.Bold,
-                textAlign = TextAlign.Center
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
             )
         },
         text = {
@@ -11040,8 +12104,8 @@ fun CustomRssFeedDialog(vm: PodcastViewModel) {
                                 modifier = Modifier.size(20.dp)
                             )
                             Spacer(Modifier.width(10.dp))
-                            Column {
-                                Text(
+                            Column(modifier = Modifier.weight(1f)) {
+                                AutoFitSingleLineText(
                                     text = "Requires Username & Password",
                                     style = MaterialTheme.typography.bodyMedium,
                                     fontWeight = FontWeight.SemiBold

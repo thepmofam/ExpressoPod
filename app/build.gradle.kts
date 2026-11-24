@@ -12,16 +12,18 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+base.archivesName.set("com.rpmtech.expressopod")
+
 android {
     namespace = "com.rpmtech.expressopod"
-    compileSdk = 35
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.rpmtech.expressopod"
         minSdk = 26
-        targetSdk = 35
-        versionCode = 2
-        versionName = "1.1"
+        targetSdk = 37
+        versionCode = 1
+        versionName = "1.0"
     }
 
     signingConfigs {

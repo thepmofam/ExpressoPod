@@ -43,6 +43,7 @@ import androidx.glance.appwidget.provideContent
 import androidx.glance.appwidget.updateAll
 import androidx.glance.background
 import androidx.glance.layout.*
+import androidx.glance.text.FontFamily
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
@@ -52,6 +53,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+
+private val GoogleSansWidgetFontFamily = FontFamily("google-sans-flex")
 
 data class WidgetQueueItem(
     val title: String,
@@ -78,7 +81,7 @@ fun queueArtworkFile(context: Context, artUrl: String, fallbackIndex: Int): File
     val fileName = if (artUrl.isNotBlank()) {
         "widget_queue_art_${artUrl.hashCode().toUInt().toString(16)}.png"
     } else {
-        "widget_queue_art_$fallbackIndex.png"
+        "widget_queue_art_empty_$fallbackIndex.png"
     }
     return File(context.filesDir, fileName)
 }
@@ -87,9 +90,9 @@ suspend fun Context.cacheWidgetArtwork(artUrl: String): Boolean {
     if (artUrl.isBlank()) return false
     return withContext(Dispatchers.IO) {
         try {
-            val loader = coil.ImageLoader(this@cacheWidgetArtwork)
+            val loader = coil.Coil.imageLoader(this@cacheWidgetArtwork)
             val request = coil.request.ImageRequest.Builder(this@cacheWidgetArtwork)
-                .data(artUrl)
+                .data(ArtworkResolver.normalizeUrl(artUrl))
                 .size(512, 512)
                 .allowHardware(false)
                 .build()
@@ -116,14 +119,14 @@ suspend fun Context.cacheWidgetArtwork(artUrl: String): Boolean {
 
 suspend fun Context.cacheQueueArtworks(queue: List<WidgetQueueItem>) {
     withContext(Dispatchers.IO) {
-        val loader = coil.ImageLoader(this@cacheQueueArtworks)
+        val loader = coil.Coil.imageLoader(this@cacheQueueArtworks)
         queue.take(3).forEachIndexed { index, item ->
             if (item.artworkUrl.isNotBlank()) {
                 val file = queueArtworkFile(this@cacheQueueArtworks, item.artworkUrl, index)
                 if (!file.exists() || file.length() == 0L) {
                     try {
                         val req = coil.request.ImageRequest.Builder(this@cacheQueueArtworks)
-                            .data(item.artworkUrl)
+                            .data(ArtworkResolver.normalizeUrl(item.artworkUrl))
                             .size(120, 120)
                             .allowHardware(false)
                             .build()
@@ -459,7 +462,8 @@ class PodcastWidget : GlanceAppWidget() {
                                     style = TextStyle(
                                         color = textPrimary,
                                         fontSize = 15.sp,
-                                        fontWeight = FontWeight.Bold
+                                        fontWeight = FontWeight.Bold,
+                                        fontFamily = GoogleSansWidgetFontFamily
                                     ),
                                     maxLines = 1,
                                     modifier = GlanceModifier
@@ -474,7 +478,8 @@ class PodcastWidget : GlanceAppWidget() {
                                         style = TextStyle(
                                             color = textSecondary,
                                             fontSize = 12.sp,
-                                            fontWeight = FontWeight.Normal
+                                            fontWeight = FontWeight.Normal,
+                                            fontFamily = GoogleSansWidgetFontFamily
                                         ),
                                         maxLines = 1
                                     )
@@ -535,7 +540,8 @@ class PodcastWidget : GlanceAppWidget() {
                                     text = "Queue is empty",
                                     style = TextStyle(
                                         color = textSecondary,
-                                        fontSize = 12.sp
+                                        fontSize = 12.sp,
+                                        fontFamily = GoogleSansWidgetFontFamily
                                     )
                                 )
                             }
@@ -544,11 +550,8 @@ class PodcastWidget : GlanceAppWidget() {
                                 val queueArtFile = remember(index, item.artworkUrl, item.audioUrl) {
                                     queueArtworkFile(context, item.artworkUrl, index)
                                 }
-                                val legacyArtFile = remember(index) {
-                                    File(context.filesDir, "widget_queue_art_$index.png")
-                                }
-                                val queueArtBitmap: Bitmap? = remember(queueArtFile.lastModified(), legacyArtFile.lastModified(), item.artworkUrl, item.audioUrl) {
-                                    if (queueArtFile.exists() && queueArtFile.length() > 0) {
+                                val queueArtBitmap: Bitmap? = remember(queueArtFile.lastModified(), item.artworkUrl, item.audioUrl) {
+                                    if (item.artworkUrl.isNotBlank() && queueArtFile.exists() && queueArtFile.length() > 0) {
                                         try {
                                             BitmapFactory.decodeFile(queueArtFile.absolutePath)
                                         } catch (e: Exception) {
@@ -556,12 +559,6 @@ class PodcastWidget : GlanceAppWidget() {
                                         }
                                     } else if (item.artworkUrl.isNotBlank() && item.artworkUrl == currentArtUrl && artBitmap != null) {
                                         artBitmap
-                                    } else if (legacyArtFile.exists() && legacyArtFile.length() > 0) {
-                                        try {
-                                            BitmapFactory.decodeFile(legacyArtFile.absolutePath)
-                                        } catch (e: Exception) {
-                                            null
-                                        }
                                     } else null
                                 }
 
@@ -624,7 +621,8 @@ class PodcastWidget : GlanceAppWidget() {
                                             style = TextStyle(
                                                 color = textPrimary,
                                                 fontSize = 14.sp,
-                                                fontWeight = FontWeight.Bold
+                                                fontWeight = FontWeight.Bold,
+                                                fontFamily = GoogleSansWidgetFontFamily
                                             ),
                                             maxLines = 1
                                         )
@@ -635,7 +633,8 @@ class PodcastWidget : GlanceAppWidget() {
                                                 style = TextStyle(
                                                     color = textSecondary,
                                                     fontSize = 12.sp,
-                                                    fontWeight = FontWeight.Normal
+                                                    fontWeight = FontWeight.Normal,
+                                                    fontFamily = GoogleSansWidgetFontFamily
                                                 ),
                                                 maxLines = 1
                                             )

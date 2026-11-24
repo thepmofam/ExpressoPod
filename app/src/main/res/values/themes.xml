@@ -3,5 +3,6 @@
     <style name="Theme.ExpressoPod" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:forceDarkAllowed" tools:targetApi="q">false</item>
         <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:fontFamily">@font/google_sans_flex_rounded</item>
     </style>
 </resources>
